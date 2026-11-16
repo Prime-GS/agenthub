@@ -28,8 +28,8 @@ Non-goals:
 
 | Component | Role |
 |---|---|
-| `agenthubd` | The hub: one process per user, systemd user service, socket-activated. Holds sessions, runs, the queue; decides admission and shedding. |
-| `agenthub` | The client CLI: `run`, `status`, `session`, `prio`, `why`, `stop`. Runs commands in the caller's context. |
+| `agenthubd` | The hub (`agenthub hub`): one process per user, systemd user service, socket-activated. Holds sessions, runs, the queue; decides admission and shedding. |
+| `agenthub` | The client CLI: `run`, `status`, `why`, `stop`, `session start\|end\|prio`, `install`, `uninstall`. Runs commands in the caller's context. |
 | systemd units | `agenthub.socket`, `agenthub.service`, `agenthub.slice` and four class slices. |
 | Integrations | Claude Code plugin (hooks + status line), later an MCP server for other agents. |
 
@@ -43,7 +43,7 @@ user@UID.service
     ├── agenthub-p1.slice             CPUWeight=400                            high
     ├── agenthub-p2.slice             CPUWeight=100                            normal (default)
     └── agenthub-p3.slice             CPUWeight=25                             background
-        └── agenthub-run-<id>.scope   one per admitted run, MemoryHigh=<estimate × 1.5>
+        └── agenthub-run-<id>.scope   one per admitted run, MemoryHigh=<estimate × 1.5, at least 256 MiB>
 ```
 
 Weights are hierarchical: the class weights only divide what `agenthub.slice` gets, and `agenthub.slice`
@@ -63,31 +63,41 @@ run a unit name the hub can stop over D-Bus, and makes the state discoverable af
 
 A session is one agent instance: a Claude Code session, a Codex session, or any process that registers.
 
-- **Registration:** `agenthub session start --agent claude-code --id <session_id> --pid <agent pid> --cwd <dir>
-  [--title <text>]`, called from the agent's start hook.
-- **Class:** decided in this order — a runtime override (`agenthub prio`), the first matching project rule in
-  the config (path glob → class), the default class (`p2`).
+- **Registration:** `agenthub session start <session_id> --agent claude-code --pid <agent pid> --cwd <dir>
+  [--title <text>]`, called from the agent's start hook. Without `--pid` the calling shell is the session's
+  process; `--pid 0` makes a session that lives until `agenthub session end`.
+- **Implicit session:** `agenthub run` without `--session` (and without `$AGENTHUB_SESSION`) registers the
+  calling shell as session `pid-<shell pid>`, so a plain terminal works with no setup.
+- **Class:** decided in this order — a runtime override (`agenthub session prio <id> <class>`), the first
+  matching project rule in the config (path glob → class), the default class (`p2`). The override survives the
+  session registering again.
 - **Liveness:** the hub opens a pidfd for the agent process, so a crashed session is noticed at once, without
   polling. `agenthub session end` from the agent's end hook is a courtesy, not a requirement.
 - **Subagents:** runs carry an optional `agent_id`, so the status shows which subagent of a session started what.
+- **Persistence:** sessions are written to `$XDG_RUNTIME_DIR/agenthub/sessions/`; after a hub restart those
+  whose process is still alive come back with their class and override.
 
 ## 4. Runs
 
 A run is one heavy command.
 
 1. The client sends `request` with the command, cwd, session, kind, pools and an optional explicit estimate.
-2. The hub answers `grant` (with a run id and the slice), `queued` (position and reason), or `refused`.
+2. The hub answers `grant` (with a run id and the slice), `queued` (position and reason), or `refused`; on
+   `refused` the client exits with **69** (`EX_UNAVAILABLE`) without running the command.
 3. On `grant` the client starts the command with `systemd-run --user --scope` in the class slice, under the
    run's unit name and `MemoryHigh`, and reports `started` with the scope name.
-4. The hub watches the scope's `cgroup.events` (populated → 0) to learn that the run ended, reads
-   `memory.peak` and `cpu.stat`, and records them in the history.
-5. The client exits with the command's exit code. If the hub stopped the run, the client exits with **75**
-   (`EX_TEMPFAIL`) and prints why, so the agent sees the reason in the command's own output.
+4. The hub watches the scope's `cgroup.events` (populated → 0, through inotify) to learn that the run ended,
+   whoever started it, reads `memory.peak` and `cpu.stat`, and records them in the history (M2). The peak is
+   best effort: systemd may remove the scope before the hub reads it.
+5. The client exits with the command's exit code. If the hub stopped the run, or the run's `wait` passed in
+   the queue, the client exits with **75** (`EX_TEMPFAIL`) and prints why, so the agent sees the reason in the
+   command's own output. Signals sent to the client (TERM, INT, HUP) are passed on to the command.
 
 ### 4.1 Which commands are heavy
 
 Commands are classified by rules in the config (regular expression on the command line → kind, default
-estimate, pools, class adjustment). Unmatched commands run directly and are not tracked. Examples of kinds:
+estimate, pools, class adjustment). A command an integration hook sees that matches no rule runs directly
+and is not tracked; an explicit `agenthub run` is always tracked, as kind `other` when no rule matches. Examples of kinds:
 `build` (`tsc`, `npm run build`, `cargo build`, Gradle), `test` (`jest`, `pytest`, `go test`), `browser`
 (Playwright, Puppeteer), `emulator`, `stand` (long-lived dev servers).
 
@@ -95,7 +105,8 @@ estimate, pools, class adjustment). Unmatched commands run directly and are not 
 
 The expected peak memory of a run comes from, in order: an explicit `--estimate`; the 90th percentile of
 `memory.peak` over the last 20 runs with the same fingerprint (program, subcommand, project root); the kind's
-default from the config; a global default. Estimates are kept in a SQLite file under `$XDG_STATE_HOME`.
+default from the config; the global `default_estimate` (1 GiB). Estimates are kept in a SQLite file under
+`$XDG_STATE_HOME`. M1 uses the explicit estimate, the kind default and the global default; history comes in M2.
 
 ### 4.3 Long-lived runs
 
@@ -114,6 +125,9 @@ headroom  = free − growth
 grant if  estimate ≤ headroom  and every pool the run needs has a free unit
 ```
 
+A run whose estimate is above the whole `agent_budget` is refused at once instead of waiting forever. The hub
+decides again on every run end and every 2 s while anything waits.
+
 `growth` matters: a build admitted five seconds ago has not reached its peak yet, and without counting what it
 is still going to take, the hub would admit three builds into room for one.
 
@@ -126,6 +140,8 @@ Ordering:
   ahead. Otherwise a stream of small runs would starve a large high-priority one.
 - **Pool backfill is allowed:** if the head waits for a pool (for example the only emulator), runs that do not
   need that pool may start.
+
+M1 implements the memory rule, class order and no memory backfill; aging and pools come with M2.
 
 Every `queued` answer carries the reason: `needs 3.1 GiB, 1.2 GiB above reserve`, `pool emulator 1/1 held by
 session B`, `memory pressure — admissions paused`.
@@ -174,20 +190,26 @@ QUEUE 43  9c02…  p3  browser  est 1.5 GiB  waiting 2m: pool browser 2/2 held (
 - `agenthub.socket` (`ListenStream=%t/agenthub.sock`, `SocketMode=0600`) activates `agenthub.service`
   (`Type=notify`, `WatchdogSec=30`, `Restart=on-failure`, its own small `MemoryMax`). Connections made while the
   hub restarts are queued by the socket, not refused.
-- On start the hub rebuilds runtime state from systemd: every `agenthub-run-*.scope` plus the metadata file the
-  client wrote under `$XDG_RUNTIME_DIR/agenthub/runs/`. Sessions re-register on their next request.
-- The hub exits after 10 minutes with no sessions and no runs; the socket brings it back.
+- On start the hub rebuilds runtime state from cgroupfs and its state directory: every populated
+  `agenthub-run-*.scope` plus the metadata file the hub wrote under `$XDG_RUNTIME_DIR/agenthub/runs/`, the
+  sessions whose process is alive, and the run-id counter. A scope without metadata is still accounted, as an
+  unknown run. A request that was queued is queued again by its client (see below).
+- The hub exits after `idle_exit` (10 minutes by default) with no sessions, no runs and no connections; the
+  socket brings it back.
 
 | Failure | Behaviour |
 |---|---|
-| Hub not reachable within 1 s | client runs the command directly in its class slice, prints a warning; CPU weights still apply |
-| `systemd-run` not available | client runs the command as a plain child process |
+| Hub not reachable within 1 s, or silent for 5 s after accepting | client runs the command directly in its class slice, prints a warning; CPU weights still apply |
+| `systemd-run` or the user manager not available | client runs the command as a plain child process; the hub tracks it through the client's connection only, so a hub restart forgets it |
+| `systemd-run` slow to create the scope | the hub waits up to 30 s for the scope before it counts the run as ended |
 | Hub crashes during runs | runs keep going (they belong to systemd, not the hub); state rebuilt on restart |
+| Hub restarts while a client is queued | client reconnects (up to 5 s each time, at most three times) and queues again, at the back of its class; after that it fails open |
 | Client killed while queued | hub sees the socket close and drops the request |
+| Client gone between grant and start, or hub restarted then | the run is adopted as soon as its scope runs; the grant is dropped after 15 s if it never does |
 | Client killed while running | the scope lives on until the command ends; the hub still accounts it |
 | Agent session crashes | pidfd closes; queued requests dropped; running runs finish |
 | PSI triggers unavailable (kernel < 6.5) | hub samples pressure files every 2 s while any run is active |
-| Config error | hub refuses to start and says where; clients fail open |
+| Config error | hub exits with 78 and names the file, line and key; systemd does not restart it; clients fail open |
 
 ## 9. Security
 
@@ -204,9 +226,11 @@ QUEUE 43  9c02…  p3  browser  est 1.5 GiB  waiting 2m: pool browser 2/2 held (
 
 ```toml
 [machine]
-desktop_reserve = "4G"      # never handed to agent work
+desktop_reserve = "4G"      # never handed to agent work (default 15 %)
 agent_budget = "auto"       # RAM minus desktop_reserve
-aging_step = "5m"
+default_estimate = "1G"     # a run with no estimate and no matching kind
+idle_exit = "10m"           # the hub exits when idle; the socket starts it again
+aging_step = "5m"           # M2
 
 [classes]
 p0 = { cpu_weight = 1000, memory_low = "2G", preemptible = false }
@@ -239,6 +263,11 @@ estimate = "1.5G"
 pools = ["browser"]
 ```
 
+Sizes take `K/M/G/T` (binary) or a percentage of RAM; durations take `ms/s/m/h`. Pools, aging and
+`preemptible` are read from M2 on. `$AGENTHUB_CONFIG` points to another file; `$AGENTHUB_PREFIX` renames the
+units, the socket and the state directory (the tests use `agenthubtest`). The slice limits are written into the
+unit files at `agenthub install`, so a changed budget needs `agenthub install` again.
+
 ## 11. Language and size
 
 Python 3.11+ with the standard library only (`asyncio`, `socket`, `sqlite3`, `tomllib`), talking to systemd
@@ -247,6 +276,11 @@ small enough to read in one sitting. A port to a compiled language stays possibl
 plain JSON lines.
 
 ## 12. Testing
+
+M1 ships three layers: `tests/test_config.py` and `tests/test_scheduler.py` (pure logic), `tests/test_hub.py`
+(the hub over its socket with fake memory readings and a fake cgroup tree), and `tests/test_integration.py`
+(the real user manager, only with `AGENTHUB_IT=1`: prefix `agenthubtest`, a 600 MiB budget, `sleep` and CPU
+burners pinned to one core). The plan for all milestones:
 
 - **Scheduler core as pure functions:** admission, ordering, aging, backfill and victim choice are tested with a
   fake clock and fake memory readings.

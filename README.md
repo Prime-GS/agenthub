@@ -5,8 +5,9 @@ command (build, test suite, headless browser, emulator, dev stand) asks it for r
 priority, and the kernel shares CPU between priorities by weight. Nobody needs a cron job, and a session that
 never heard of the others still cannot sink the machine.
 
-> **Status: design stage.** This repository holds the design documents only — no code yet.
-> See [docs/roadmap.md](docs/roadmap.md) for what comes first.
+> **Status: milestone M1 (core hub) works.** Sessions, a priority queue with admission by memory, class slices
+> and a fail-open client run on a real systemd user manager. Pressure handling and the Claude Code plugin come
+> next — see [docs/roadmap.md](docs/roadmap.md).
 > На русском — [README.ru.md](README.ru.md).
 
 ## The problem
@@ -68,7 +69,7 @@ admission and a live picture of the machine on Linux.
 | [docs/prior-art.md](docs/prior-art.md) | Existing tools and issues, and why none of them covers this |
 | [docs/roadmap.md](docs/roadmap.md) | Milestones and open questions |
 
-## Requirements (planned)
+## Requirements
 
 Linux with cgroup v2 and a systemd user manager (cpu and memory delegated — the default on current distros),
 kernel 6.5+ for unprivileged PSI triggers (older kernels fall back to 2-second sampling), Python 3.11+.
@@ -76,3 +77,20 @@ kernel 6.5+ for unprivileged PSI triggers (older kernels fall back to 2-second s
 ## License
 
 [MIT](LICENSE)
+
+## Try it
+
+```sh
+git clone https://github.com/Prime-GS/agenthub && cd agenthub
+python3 -m agenthub install                  # user units + ~/.local/bin/agenthub, no root
+agenthub session start demo --cwd .          # optional, ends with this shell; without it the shell is the session
+agenthub session prio demo p1
+agenthub run --session demo --estimate 2G -- npm run build
+agenthub status                              # machine, sessions, runs, queue with reasons
+agenthub why 3                               # one decision in full
+agenthub uninstall
+```
+
+Configuration lives in `~/.config/agenthub/config.toml` ([design §10](docs/design.md#10-configuration)); without
+it the hub keeps 15 % of RAM for the desktop and gives the rest to agent work. Tests:
+`python3 -m unittest discover -s tests`; `AGENTHUB_IT=1` adds the tests against the real user manager.

@@ -3,7 +3,7 @@
 | Milestone | Content | Done when |
 |---|---|---|
 | **M0 — design** | These documents | Published |
-| **M1 — core** | `agenthubd` with sessions, runs, queue, admission by memory, class slices, fail-open client, `status`/`why`; systemd units; installer for the user manager | Two sessions with different classes on a real machine: the lower one waits for memory, both get CPU by weight; hub restart mid-run loses nothing |
+| **M1 — core** (done) | `agenthubd` with sessions, runs, queue, admission by memory, class slices, fail-open client, `status`/`why`; systemd units; installer for the user manager | Two sessions with different classes on a real machine: the lower one waits for memory, both get CPU by weight; hub restart mid-run loses nothing |
 | **M2 — pressure** | PSI triggers, shedding, learned estimates (SQLite history), pools, aging | A synthetic memory storm sheds exactly one lowest-class run and the desktop stays responsive |
 | **M3 — Claude Code plugin** | SessionStart/PreToolUse/SessionEnd/PostToolUse hooks, waiting in the hook, status line | Several real sessions run builds and tests through the hub without any instruction in `CLAUDE.md` |
 | **M4 — other agents** | MCP server for agents without hooks, wrapper for Codex CLI and plain terminals | A non-Claude agent shares the same queue |
