@@ -100,14 +100,16 @@ agenthub root-extras > agenthub-root.sh      # optional: read it, then sudo sh a
 agenthub uninstall
 ```
 
-With Claude Code, start sessions with the plugin and nothing else changes — builds and tests the agent runs wait
-for room in the hub ([docs/claude-code.md](docs/claude-code.md)):
+With Claude Code, install the plugin once and nothing else changes — builds and tests the agent runs in every new
+session wait for room in the hub ([docs/claude-code.md](docs/claude-code.md)):
 
 ```sh
-claude --plugin-dir ./claude-code
+claude plugin marketplace add "$PWD"         # this checkout; or Prime-GS/agenthub
+claude plugin install agenthub@agenthub      # for every session; `claude --plugin-dir ./claude-code` for one
 ```
 
-Other agents run under the wrapper, or call the MCP server's `run` tool ([docs/other-agents.md](docs/other-agents.md)):
+Other agents run under the wrapper, or call the MCP server's `run` tool ([docs/other-agents.md](docs/other-agents.md),
+which also shows a `codex` command that always starts Codex wrapped):
 
 ```sh
 agenthub wrap -- codex                       # its make, npm, cargo, pytest… wait for room too

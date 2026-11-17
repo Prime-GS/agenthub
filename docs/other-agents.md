@@ -67,6 +67,36 @@ Codex also has hooks, but a `PreToolUse` hook may rewrite a command only togethe
 `permissionDecision: "allow"`, which would approve every rewritten command past Codex's own approval rules. The
 wrapper changes nothing about approvals: Codex asks for the same commands as before.
 
+### Every start wrapped
+
+To make plain `codex` (or any other agent command) start wrapped, put a script of that name in a directory that
+comes before the real one in `PATH`, such as `~/.local/bin/codex`:
+
+```sh
+#!/bin/sh
+# agenthub: Codex CLI starts as an agenthub session; delete this file to start Codex directly again
+self=$(readlink -f "$0")
+real=
+IFS=:
+for dir in $PATH; do
+    [ -n "$dir" ] && [ -x "$dir/codex" ] || continue
+    [ "$(readlink -f "$dir/codex")" = "$self" ] && continue
+    real="$dir/codex"
+    break
+done
+unset IFS
+[ -n "$real" ] || { echo "codex: command not found (agenthub wrapper: no other codex on PATH)" >&2; exit 127; }
+# inside a run of the hub its grant covers it; without agenthub there is nothing to join
+if [ -n "${AGENTHUB_RUN:-}" ] || ! command -v agenthub >/dev/null 2>&1; then
+    exec "$real" "$@"
+fi
+exec agenthub wrap --agent codex -- "$real" "$@"
+```
+
+It skips itself by its resolved path, so the real `codex` is the next one in `PATH`, started by its full path
+(no loop). It covers whatever starts `codex` through `PATH`; an IDE extension or a desktop app that starts its
+own copy of Codex, and a shell that puts another `codex` first (`nvm use` of another Node version), pass it by.
+
 ## `agenthub mcp`
 
 An MCP server on stdio. Codex:

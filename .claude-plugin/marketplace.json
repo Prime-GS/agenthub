@@ -1,0 +1,14 @@
+{
+  "name": "agenthub",
+  "owner": {"name": "Prime-GS"},
+  "metadata": {"description": "agenthub: one load hub for every AI coding agent on a Linux machine"},
+  "plugins": [
+    {
+      "name": "agenthub",
+      "source": "./claude-code",
+      "description": "Routes heavy Bash commands (builds, tests, headless browsers) through the agenthub load hub: one queue by priority and memory for every agent session on the machine.",
+      "license": "MIT",
+      "homepage": "https://github.com/Prime-GS/agenthub"
+    }
+  ]
+}

@@ -7,12 +7,20 @@ Claude Code is the first agent agenthub integrates with. The integration is a pl
 ## Using it
 
 ```sh
-python3 -m agenthub install                         # the hub (once per machine)
-claude --plugin-dir /path/to/agenthub/claude-code   # a session with the plugin
+python3 -m agenthub install                          # the hub (once per machine)
+claude plugin marketplace add /path/to/agenthub      # the checkout's marketplace (or: Prime-GS/agenthub)
+claude plugin install agenthub@agenthub              # every new session, in any directory
+claude --plugin-dir /path/to/agenthub/claude-code    # or: one session with the plugin
 ```
 
-The hooks call `claude-code/hooks/hook.sh`, which runs the agenthub package of the same checkout, or the
-`agenthub` command on `PATH` when the plugin was copied elsewhere; with neither it does nothing. A rewritten
+The hooks call `claude-code/hooks/hook.sh`, which runs the agenthub package of the same checkout; an installed
+plugin is a copy in Claude Code's plugin cache, so there it runs the `agenthub` command — from `PATH`, or the one
+`agenthub install` wrote to `~/.local/bin` — which runs the package of the checkout it was installed from. With
+neither it does nothing. So the checkout stays where it was installed from, a change of the Python package
+applies at once, and a change of `claude-code/` reaches new sessions after `claude plugin marketplace update
+agenthub` and `claude plugin update agenthub@agenthub` (with a new `version` in `plugin.json`).
+
+The plugin's hooks run next to any hooks of the user's own settings; Claude Code runs them all. A rewritten
 command calls the same package: `agenthub` when that command is the wrapper `agenthub install` wrote for it,
 otherwise the interpreter and package path in full. No line in
 `CLAUDE.md` is needed: the agent writes `npm run build` as usual, and the hook routes it.

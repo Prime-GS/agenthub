@@ -380,5 +380,35 @@ class ClaimTest(unittest.TestCase):
         self.assertEqual(self.hub.sched.runs[rid].state, 'cancelled')   # the new request is another run
 
 
+class PluginTest(unittest.TestCase):
+    def test_the_marketplace_lists_the_plugin(self):
+        with open(os.path.join(system.ROOT, '.claude-plugin', 'marketplace.json')) as f:
+            market = json.load(f)
+        [entry] = market['plugins']
+        plugin = os.path.join(system.ROOT, entry['source'])
+        with open(os.path.join(plugin, '.claude-plugin', 'plugin.json')) as f:
+            self.assertEqual(json.load(f)['name'], entry['name'])
+        with open(os.path.join(plugin, 'hooks', 'hooks.json')) as f:
+            self.assertEqual(sorted(json.load(f)['hooks']), ['PostToolUse', 'PreToolUse', 'SessionEnd', 'SessionStart'])
+
+    def test_an_installed_copy_finds_the_agenthub_command(self):
+        # Claude Code copies the plugin into its cache: no package next to it, maybe no ~/.local/bin on PATH
+        with tempfile.TemporaryDirectory() as d:
+            hook = os.path.join(d, 'cache', 'agenthub', '0.1.0', 'hooks', 'hook.sh')
+            os.makedirs(os.path.dirname(hook))
+            with open(os.path.join(system.ROOT, 'claude-code', 'hooks', 'hook.sh')) as src, open(hook, 'w') as dst:
+                dst.write(src.read())
+            env = {'HOME': d, 'PATH': '/usr/bin:/bin'}
+            out = subprocess.run(['sh', hook, 'pre-tool-use'], env=env, input='{}', capture_output=True, text=True)
+            self.assertEqual((out.returncode, out.stdout), (0, ''))   # nothing installed: does nothing
+            stub = os.path.join(d, '.local', 'bin', 'agenthub')
+            os.makedirs(os.path.dirname(stub))
+            with open(stub, 'w') as f:
+                f.write('#!/bin/sh\necho "called $*"\n')
+            os.chmod(stub, 0o755)
+            out = subprocess.run(['sh', hook, 'pre-tool-use'], env=env, input='{}', capture_output=True, text=True)
+            self.assertEqual(out.stdout, 'called hook pre-tool-use\n')
+
+
 if __name__ == '__main__':
     unittest.main()
