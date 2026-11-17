@@ -285,7 +285,7 @@ class HookTest(unittest.TestCase):
         self.start()
         self.hook('session-start', source='startup')
         cli = [sys.executable, '-P', '-m', 'agenthub', 'status', '--line']
-        env = dict(os.environ, PYTHONPATH=claude.ROOT)
+        env = dict(os.environ, PYTHONPATH=system.ROOT)
         out = subprocess.run(cli, input='{"session_id": "claude-1", "model": {}}', capture_output=True, text=True,
                              env=env, timeout=10)
         self.assertEqual(out.stdout, 'hub ▸ room 6.8 GiB · you p2\n')
@@ -299,15 +299,15 @@ class HookTest(unittest.TestCase):
     def test_launcher_is_this_package(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, 'agenthub')
+            direct = shlex.join(system.self_command())
             with mock.patch.dict(os.environ, {'PATH': d}):
-                self.assertIn(' -P -m agenthub', claude.launcher())   # nothing on PATH
-                for text, expect in ((f'#!/bin/sh\nPYTHONPATH={shlex.quote(claude.ROOT)} exec python3 -P -m agenthub',
-                                      'agenthub'), ('#!/bin/sh\nPYTHONPATH=/old/checkout exec python3 -m agenthub',
-                                                    f'PYTHONPATH={shlex.quote(claude.ROOT)} ')):
+                self.assertEqual(claude.launcher(), direct)   # nothing on PATH
+                for text, expect in ((f'#!/bin/sh\nexec {direct} "$@"\n', 'agenthub'),   # what install writes
+                                     ('#!/bin/sh\nPYTHONPATH=/old/checkout exec python3 -m agenthub', direct)):
                     with open(path, 'w') as f:
                         f.write(text)
                     os.chmod(path, 0o755)
-                    self.assertTrue(claude.launcher().startswith(expect), text)
+                    self.assertEqual(claude.launcher(), expect, text)
 
     def test_a_silent_hub_does_not_hold_the_hook_past_its_limit(self):
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

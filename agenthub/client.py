@@ -103,13 +103,32 @@ def session_id(explicit):
     return (sid, False) if sid else (f'pid-{os.getppid()}', True)
 
 
+def agent_name(text):
+    """An agent's name as part of a session id: letters, digits and `._-`, up to 40."""
+    name = ''.join(c if c.isalnum() and c.isascii() or c in '._-' else '-' for c in text)[:40].strip('.-_')
+    return name or 'agent'
+
+
 def register(conn, sid, implicit, cwd):
-    msg = {'op': 'session.start', 'session': sid, 'agent': 'shell' if implicit else 'unknown', 'cwd': cwd,
-           'pid': os.getppid() if implicit else None}
+    """An explicit session the hub does not know: `agenthub wrap` and `agenthub mcp` leave the agent's pid and
+    name in the environment, so the hub can still end the session when the agent exits."""
+    mine = not implicit and os.environ.get('AGENTHUB_SESSION') == sid   # not one an agent inside it made
+    pid = os.environ.get('AGENTHUB_SESSION_PID', '') if mine else ''
+    msg = {'op': 'session.start', 'session': sid, 'cwd': cwd,
+           'agent': 'shell' if implicit else (mine and os.environ.get('AGENTHUB_AGENT')) or 'unknown',
+           'pid': os.getppid() if implicit else int(pid) if pid.isdigit() else None}
     return conn.call(msg)
 
 
 # run
+
+def child_env(rid):
+    """The command's environment: `AGENTHUB_RUN` marks it as inside a run (a shim it starts steps aside), and
+    `systemd-run --user` finds the user manager even when the caller (an MCP client) left XDG_RUNTIME_DIR out."""
+    env = dict(os.environ, AGENTHUB_RUN=str(rid))
+    env.setdefault('XDG_RUNTIME_DIR', system.runtime_dir())
+    return env
+
 
 def run_direct(argv, cwd, why, pfx):
     """The hub is not there: run anyway, in the class slice when systemd allows, so CPU weights still apply."""
@@ -120,7 +139,7 @@ def run_direct(argv, cwd, why, pfx):
     say(f'{why}; running without the hub (class {cls})')
     if system.can_make_scopes():
         argv = system.scope_argv(system.direct_unit(pfx), system.class_slice(pfx, cls), 'infinity', argv)
-    return exit_code(subprocess.call(argv))
+    return exit_code(subprocess.call(argv, env=child_env('direct')))
 
 
 def wait_for_grant(conn, request):
@@ -172,7 +191,9 @@ def execute(conn, grant, argv, pfx):
     """Runs the granted command in its scope; returns (exit code, stop reason or None)."""
     rid, unit = grant['run'], grant['unit']
     scoped = system.can_make_scopes()
-    proc = subprocess.Popen(system.scope_argv(unit, grant['slice'], grant['memory_high'], argv) if scoped else argv)
+    # a tool this command starts through a shim must not queue behind the grant its own parent holds
+    proc = subprocess.Popen(system.scope_argv(unit, grant['slice'], grant['memory_high'], argv) if scoped else argv,
+                            env=child_env(rid))
     previous = forward_signals(proc)
     deadline = time.monotonic() + START_WAIT
     # report the start only once the scope exists, so the hub can watch it

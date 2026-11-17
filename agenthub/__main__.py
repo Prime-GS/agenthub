@@ -52,6 +52,16 @@ def parser():
     hook = sub.add_parser('hook', help='a Claude Code hook: reads its JSON on stdin (used by the plugin)')
     hook.add_argument('event', choices=('session-start', 'session-end', 'pre-tool-use', 'post-tool-use'))
 
+    wrap = sub.add_parser('wrap', help='run an agent without hooks (Codex CLI, a shell) as a session whose builds '
+                                       'and tests go through the hub')
+    wrap.add_argument('--agent', help='agent name for the session (default: the program\'s name)')
+    wrap.add_argument('argv', nargs=argparse.REMAINDER, help='-- command and arguments')
+
+    sub.add_parser('mcp', help='MCP server on stdio with a `run` tool, for agents without hooks')
+    shim = sub.add_parser('shim')   # what the shims of `wrap` call; not for people
+    shim.add_argument('tool')
+    shim.add_argument('args', nargs=argparse.REMAINDER)
+
     sub.add_parser('hub', help='run the hub in the foreground (systemd starts it through the socket)')
     for name in ('install', 'uninstall'):
         i = sub.add_parser(name, help=f'{name} the systemd user units')
@@ -67,6 +77,15 @@ def main(argv=None):
     if args.command == 'hook':
         from . import claude
         return claude.main(args.event)
+    if args.command in ('wrap', 'shim'):
+        from . import wrap
+        try:
+            return getattr(wrap, f'cmd_{args.command}')(args)
+        except KeyboardInterrupt:
+            return 130
+    if args.command == 'mcp':
+        from . import mcp
+        return mcp.main()
     if args.command in ('install', 'uninstall'):
         from . import install
         return getattr(install, args.command)(runtime=args.runtime)

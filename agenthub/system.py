@@ -1,15 +1,25 @@
 """Everything that touches the machine: names, /proc, cgroupfs, systemctl, inotify, sd_notify."""
 import ctypes
+import json
 import os
 import re
 import shutil
 import socket
 import struct
 import subprocess
+import sys
 
 PREFIX = re.compile(r'^[a-z][a-z0-9]*$')
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # the directory holding this package
 CGROUP_ROOT = '/sys/fs/cgroup'
 SYSTEMCTL_TIMEOUT = 10
+
+
+def self_command():
+    """argv that runs this very package with this interpreter. Isolated (`-I`): agenthub needs only the standard
+    library, and PYTHONPATH and the rest of the environment reach the commands it starts untouched."""
+    return [sys.executable, '-I', '-c',
+            f'import sys; sys.path.insert(0, {json.dumps(ROOT)}); from agenthub.__main__ import main; sys.exit(main())']
 
 
 def prefix():

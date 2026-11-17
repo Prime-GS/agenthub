@@ -29,9 +29,9 @@ Non-goals:
 | Component | Role |
 |---|---|
 | `agenthubd` | The hub (`agenthub hub`): one process per user, systemd user service, socket-activated. Holds sessions, runs, the queue; decides admission and shedding. |
-| `agenthub` | The client CLI: `run`, `status`, `why`, `stop`, `admissions`, `session start\|end\|prio`, `hook`, `install`, `uninstall`. Runs commands in the caller's context. |
+| `agenthub` | The client CLI: `run`, `status`, `why`, `stop`, `admissions`, `session start\|end\|prio`, `hook`, `wrap`, `mcp`, `install`, `uninstall`. Runs commands in the caller's context. |
 | systemd units | `agenthub.socket`, `agenthub.service`, `agenthub.slice` and four class slices. |
-| Integrations | Claude Code plugin in `claude-code/` (hooks; `agenthub status --line` for the status line), later an MCP server for other agents. |
+| Integrations | Claude Code plugin in `claude-code/` (hooks; `agenthub status --line` for the status line); `agenthub wrap` (shims in `PATH`) and `agenthub mcp` (an MCP server) for other agents — [other-agents.md](other-agents.md). |
 
 ### 2.1 Slice layout
 
@@ -73,6 +73,11 @@ A session is one agent instance: a Claude Code session, a Codex session, or any 
   session registering again.
 - **Liveness:** the hub opens a pidfd for the agent process, so a crashed session is noticed at once, without
   polling. `agenthub session end` from the agent's end hook is a courtesy, not a requirement.
+- **Other agents:** `agenthub wrap -- <agent>` registers `<agent>-<12 hex digits>` with its own pid and then
+  becomes the agent (`exec`), so the session ends with it; `agenthub mcp` registers `mcp-<client name>-<12 hex
+  digits>` with the pid of the process that started it, or uses `$AGENTHUB_SESSION` under a wrapper. An explicit
+  session the hub does not know is registered by `agenthub run` with `$AGENTHUB_AGENT` and
+  `$AGENTHUB_SESSION_PID` when they are set.
 - **Subagents:** runs carry an optional `agent_id`, so the status shows which subagent of a session started what.
 - **Persistence:** sessions are written to `$XDG_RUNTIME_DIR/agenthub/sessions/`; after a hub restart those
   whose process is still alive come back with their class and override.
@@ -114,6 +119,10 @@ plugin would route nothing. The tool has to stand where a command starts — at 
 after it may follow a colon (`npm run test:unit`). `docker build` is left out: its memory is charged to the
 Docker daemon, not to the run's scope. A `[[kinds]]` list of one's own replaces the built-in one; `kinds = []`
 turns kinds off.
+
+The same rules decide for the shims of `agenthub wrap` whether a tool's command goes through the hub. A command
+started inside a run (the client sets `AGENTHUB_RUN` for it) never queues again: `make` calling `cargo` would
+otherwise wait behind the grant its own parent holds.
 
 ### 4.2 Estimates
 
@@ -257,6 +266,7 @@ when the room it needed appears, through a news file its integration reads ([cla
 | Hub not reachable within 1 s, or silent for 5 s after accepting | client runs the command directly in its class slice, prints a warning; CPU weights still apply |
 | A Claude Code hook fails (no hub, broken config, unreadable settings, any error) | the hook prints nothing and exits 0: Claude Code runs the command as written |
 | A grant a hook waited for is not claimed (permission prompt denied or slow) | the grant is held for its `hold` (120 s), then dropped; a late `agenthub run --grant` queues again |
+| A shim of `agenthub wrap` or the MCP `run` tool cannot reach the hub | the command runs directly with the warning above; `wrap` starts the agent anyway |
 | `systemd-run` or the user manager not available | client runs the command as a plain child process; the hub tracks it through the client's connection only, so a hub restart forgets it |
 | `systemd-run` slow to create the scope | the hub waits up to 30 s for the scope before it counts the run as ended |
 | Hub crashes during runs | runs keep going (they belong to systemd, not the hub); state rebuilt on restart |
@@ -275,6 +285,10 @@ when the room it needed appears, through a news file its integration reads ([cla
   `SO_PEERCRED` so only the same uid can talk to it.
 - The hub never executes commands. It only grants, observes, and stops units named `agenthub-run-*` that a
   client of the same user registered.
+- `agenthub mcp` executes the commands an agent passes to its `run` tool, as the user, outside the agent's own
+  sandbox and approval rules; the tool is marked destructive so clients that ask before such calls ask, and the
+  server is meant only for agents that may run shell commands anyway ([other-agents.md](other-agents.md#security)).
+  `agenthub wrap` changes no approvals: the agent asks for the same commands as without it.
 - The history for estimates stores only the fingerprint (program, subcommand, project root), never the whole
   command line, so secrets passed as arguments do not reach the disk; the file is mode 0600 anyway. Command
   lines of live runs are kept in the hub's memory and its runtime directory (`$XDG_RUNTIME_DIR`, memory-backed);
@@ -344,7 +358,9 @@ admission, aging, pools, victim choice, fingerprints, the pressure governor with
 files), and `tests/test_integration.py` (the real user manager, only with `AGENTHUB_IT=1`: prefix
 `agenthubtest`, a 600 MiB budget, `sleep`, CPU burners pinned to one core, and a memory storm of three hogs
 with swap turned off for the test slice, which must shed exactly the newest `p3` run while a probe standing in
-for the desktop keeps its 50 ms rhythm). The plan for all milestones:
+for the desktop keeps its 50 ms rhythm). `tests/test_claude.py`, `tests/test_wrap.py` and `tests/test_mcp.py`
+run the integrations as their agents meet them — hook JSON, shims and wrapped processes, MCP over pipes —
+against such a hub; the integration tests add two wrapped agents sharing the queue. The plan for all milestones:
 
 - **Scheduler core as pure functions:** admission, ordering, aging, backfill and victim choice are tested with a
   fake clock and fake memory readings.

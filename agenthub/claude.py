@@ -18,7 +18,6 @@ from . import system
 AGENT = 'claude-code'
 HOLD = 120     # a grant waits this long for the Bash call: a permission prompt may come in between
 WAIT = 540     # the hook's own limit; Claude Code stops a hook after its 600 s timeout and runs the call unwrapped
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SHELLS = {'sh', 'dash', 'bash', 'zsh'}
 THROUGH_HUB = re.compile(r'(?:^|[\s;&|(/])agenthub\s+run\b|-m\s+agenthub\s+run\b')
 COMPLEX = ('$(', '`', '<(', '>(', '\n', '\r', '<<')   # the simple commands of such a line cannot be told apart
@@ -263,11 +262,11 @@ def judge(command, rules):
 def launcher():
     """How the Bash call reaches this very agenthub: the command on PATH when it is the wrapper `agenthub install`
     wrote for this package, else this interpreter and package (an older agenthub would not know `--grant`)."""
-    direct = f'PYTHONPATH={shlex.quote(ROOT)} {shlex.quote(sys.executable)} -P -m agenthub'
+    direct = shlex.join(system.self_command())
     found = shutil.which('agenthub')
     try:
         with open(found or '', 'rb') as f:
-            ours = f'PYTHONPATH={shlex.quote(ROOT)} '.encode() in f.read(4096)
+            ours = f'exec {direct} '.encode() in f.read(4096)
     except OSError:
         ours = False
     return 'agenthub' if ours else direct

@@ -10,7 +10,6 @@ from . import history
 from . import system
 from .config import CLASSES
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def unit_dir(runtime):
@@ -30,7 +29,7 @@ def memory_max(cfg):
     return max(cfg.agent_budget, min(int(cfg.agent_budget * 1.1), cfg.total_ram - (512 << 20)))
 
 
-def units(pfx, cfg, python=sys.executable, root=ROOT):
+def units(pfx, cfg, python=sys.executable, root=system.ROOT):
     """{file name: content} for every unit agenthub needs; numbers come from the config at install time."""
     out = {
         system.root_slice(pfx): (
@@ -73,7 +72,7 @@ def install(runtime=False):
         path = wrapper_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, 'w') as f:
-            f.write(f'#!/bin/sh\nPYTHONPATH={shlex.quote(ROOT)} exec {shlex.quote(sys.executable)} -P -m agenthub "$@"\n')
+            f.write(f'#!/bin/sh\nexec {shlex.join(system.self_command())} "$@"\n')
         os.chmod(path, 0o755)
     system.systemctl('daemon-reload', check=True)
     system.systemctl('enable' if not runtime else 'start', *(['--now'] if not runtime else []), f'{pfx}.socket',

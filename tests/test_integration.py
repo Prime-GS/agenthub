@@ -30,6 +30,11 @@ system_pressure = false   # the desktop's own pressure must not steer these test
 
 [pools]
 browser = 1
+
+[[kinds]]   # for the shims of `agenthub wrap`
+name = "build"
+match = '^make '
+estimate = "350M"
 """
 # allocates SIZE MiB (touching every page), STEP MiB every 50 ms when a step is given, then holds it for HOLD s
 HOG = """
@@ -118,6 +123,29 @@ class Integration(unittest.TestCase):
     def running(self, session, cmd_part):
         return next((r for r in self.status()['runs']
                      if r['session'] == session and cmd_part in r['cmd'] and r['state'] == 'running'), None)
+
+    def test_10_wrapped_agents_share_the_queue(self):
+        with open(os.path.join(self.tmp, 'hog.py'), 'w') as f:
+            f.write(HOG)
+        with open(os.path.join(self.tmp, 'Makefile'), 'w') as f:
+            f.write(f'hog:\n\t{sys.executable} hog.py 100 3 0\n')
+        agents = [subprocess.Popen([sys.executable, '-m', 'agenthub', 'wrap', '--agent', f'it{n}', '--', 'sh', '-c',
+                                    'ls >/dev/null; make -s hog; echo "done $AGENTHUB_SESSION"'],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=self.env,
+                                   cwd=self.tmp) for n in (1, 2)]
+        queued = self.until(lambda: self.status()['queue'], what='the second build to wait')
+        running = self.status()['runs']
+        self.assertEqual([r['cmd'] for r in running + queued], ['make -s hog', 'make -s hog'])
+        self.assertIn('needs 350 MiB', queued[0]['reason'])
+        self.assertEqual({r['session'][:4] for r in running + queued}, {'it1-', 'it2-'})
+        self.assertRegex(running[0]['unit'], rf'^{PFX}-run-\d+\.scope$')
+        outs = [a.communicate(timeout=60) for a in agents]
+        self.assertEqual([a.returncode for a in agents], [0, 0], [o[1] for o in outs])
+        sessions = [o[0].split()[-1] for o in outs]
+        self.until(lambda: not {s['id'] for s in self.status()['sessions']} & set(sessions),
+                   what='the sessions to end with their agents')
+        ended = [r for r in self.status()['recent'] if r['session'] in sessions]
+        self.assertEqual(sorted((r['cmd'], r['exit']) for r in ended), [('make -s hog', 0)] * 2)   # `ls`: no run
 
     def test_1_lower_class_waits_for_memory_and_no_overtaking(self):
         a = self.bg('--session', 'hi', '--estimate', '400M', '--', 'sh', '-c', 'cat /proc/self/cgroup; sleep 4')

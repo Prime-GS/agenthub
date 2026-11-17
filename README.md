@@ -5,9 +5,10 @@ command (build, test suite, headless browser, emulator, dev stand) asks it for r
 priority, and the kernel shares CPU between priorities by weight. Nobody needs a cron job, and a session that
 never heard of the others still cannot sink the machine.
 
-> **Status: milestones M1–M3 work.** Sessions, a priority queue with admission by memory, class slices, a
-> fail-open client, PSI-driven pausing and shedding, learned estimates, pools, aging, and a Claude Code plugin
-> that routes builds and tests through the hub run on a real systemd user manager. Other agents come next — see
+> **Status: milestones M1–M4 work.** Sessions, a priority queue with admission by memory, class slices, a
+> fail-open client, PSI-driven pausing and shedding, learned estimates, pools, aging, a Claude Code plugin that
+> routes builds and tests through the hub, and `agenthub wrap` / `agenthub mcp` for Codex CLI, terminals and MCP
+> clients run on a real systemd user manager. Optional root extras come next — see
 > [docs/roadmap.md](docs/roadmap.md).
 > На русском — [README.ru.md](README.ru.md).
 
@@ -57,7 +58,7 @@ admission and a live picture of the machine on Linux.
 - Kernel mechanisms first (cgroup v2 weights, memory protection, PSI); user space only decides admission.
 - No root. Runs under the user's systemd manager; an optional root step only adds disk I/O weights.
 - Event-driven: socket activation, PSI triggers, pidfds. No cron, no sleep loops in clients.
-- Agent-neutral core; Claude Code is the first integration (hooks + status line), others via the CLI or MCP.
+- Agent-neutral core; Claude Code has a plugin (hooks + status line), others go through `agenthub wrap` or MCP.
 - Small and boring: Python 3.11+ standard library only.
 
 ## Documents
@@ -67,6 +68,7 @@ admission and a live picture of the machine on Linux.
 | [docs/design.md](docs/design.md) | Architecture, priority model, admission, pressure handling, failure modes, security, testing |
 | [docs/protocol.md](docs/protocol.md) | The socket protocol between clients and the hub |
 | [docs/claude-code.md](docs/claude-code.md) | Claude Code integration: hooks, command rewriting, status line, permissions |
+| [docs/other-agents.md](docs/other-agents.md) | Codex CLI, terminals and MCP clients: `agenthub wrap` with its shims, `agenthub mcp` |
 | [docs/prior-art.md](docs/prior-art.md) | Existing tools and issues, and why none of them covers this |
 | [docs/roadmap.md](docs/roadmap.md) | Milestones and open questions |
 
@@ -99,6 +101,13 @@ for room in the hub ([docs/claude-code.md](docs/claude-code.md)):
 
 ```sh
 claude --plugin-dir ./claude-code
+```
+
+Other agents run under the wrapper, or call the MCP server's `run` tool ([docs/other-agents.md](docs/other-agents.md)):
+
+```sh
+agenthub wrap -- codex                       # its make, npm, cargo, pytest… wait for room too
+agenthub mcp                                 # an MCP server on stdio, for the agent's MCP settings
 ```
 
 Configuration lives in `~/.config/agenthub/config.toml` ([design §10](docs/design.md#10-configuration)); without
