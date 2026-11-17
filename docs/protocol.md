@@ -37,11 +37,14 @@ again keeps its override.
  "kind":null,"pools":null,"estimate":null,"wait":"600s"}
 ```
 
-`kind`, `pools` and `estimate` are optional. `kind` names a kind from the config instead of matching the command
-line; `pools` (a list of pool names) replaces the kind's pools; without `estimate` the hub takes the learned one,
-then the kind's, then the default ([design §4.2](design.md#42-estimates)). An unknown kind or pool is answered
-with `unknown_kind` or `unknown_pool`, and the client exits with 2 without running the command. `wait` is how long
-the client is prepared to wait in the queue; without it the client waits as long as it takes.
+`kind`, `pools`, `estimate`, `hold` and `notify` are optional. `kind` names a kind from the config instead of
+matching the command line; `pools` (a list of pool names) replaces the kind's pools; without `estimate` the hub
+takes the learned one, then the kind's, then the default ([design §4.2](design.md#42-estimates)). An unknown kind
+or pool is answered with `unknown_kind` or `unknown_pool`, and the client exits with 2 without running the command.
+`wait` is how long the client is prepared to wait in the queue; without it the client waits as long as it takes.
+`hold` (a duration above 0 and at most 600 s) is how long a grant waits for a client after this connection closes,
+instead of 15 s: a hook that waited for the grant leaves, and the command it rewrote claims the grant later.
+`notify: true` asks for a news line to the session when the room this run needed appears after its `wait` ran out.
 
 Answers on the same connection, in order:
 
@@ -58,6 +61,17 @@ The client then starts the scope and confirms:
 ```json
 {"v":1,"op":"run.started","run":43,"unit":"agenthub-run-43.scope","pid":50112}
 ```
+
+A grant whose client left on purpose (`hold`) is taken over on a new connection:
+
+```json
+{"v":1,"op":"run.claim","run":43,"session":"a1f3…"}
+{"ok":true,"state":"granted","run":43,"unit":"agenthub-run-43.scope","slice":"agenthub-p2.slice","memory_high":4939212390}
+```
+
+`session` is required. The answer is the grant itself, and the exchange goes on as after a `run.request`. A
+run that is no longer granted, belongs to another session, or already has a client is answered with
+`grant_gone`; the client then requests again.
 
 `unit` is `null` when the client could not make a scope (no `systemd-run` or no user manager): the hub then
 tracks the run only through this connection and ends it when the connection closes. With a scope, the hub
@@ -147,6 +161,7 @@ set itself under memory pressure: it lifts after 30 calm seconds and `running` d
 | `unknown_run` | no such run |
 | `unknown_kind` | `kind` names no kind in the config (client exit 2) |
 | `unknown_pool` | a pool in `pools` is not declared in the config (client exit 2) |
+| `grant_gone` | `run.claim` found no grant to take over (the client requests again) |
 | `wait_expired` | waited longer than the request allowed (client exit 75) |
 | `cancelled` | a queued run was dropped: its session ended or it was stopped (client exit 75) |
 | `refused` | the run can never fit: estimate above the whole agent budget (client exit 69) |

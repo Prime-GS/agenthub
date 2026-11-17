@@ -32,6 +32,27 @@ def state_dir(pfx):
     return os.path.join(runtime_dir(), pfx)
 
 
+def started_at(pid):
+    """The process start time in clock ticks since boot (field 22 of /proc/PID/stat); None when it is gone."""
+    try:
+        with open(f'/proc/{pid}/stat') as f:
+            return int(f.read().rsplit(')', 1)[1].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def hub_running(socket):
+    """True while a hub serves this socket. Lets frequent callers (status line, session end) skip the socket
+    when the hub is not running: connecting would start it through socket activation. The hub writes its pid and
+    start time next to the socket; a file left by a stopped hub names a dead or a different process."""
+    try:
+        with open(socket + '.pid') as f:
+            pid, start = f.read().split()[:2]
+        return started_at(int(pid)) == int(start)
+    except (OSError, ValueError):
+        return False
+
+
 def root_slice(pfx):
     return f'{pfx}.slice'
 

@@ -18,10 +18,16 @@ def parser():
                      help='take one unit of this pool while running; repeatable (default: the kind\'s pools)')
     run.add_argument('--wait', help='longest time to wait in the queue, e.g. 10m (default: no limit)')
     run.add_argument('--shell', help='run this command line with bash -c instead of argv')
+    run.add_argument('--grant', type=int, metavar='RUN',
+                     help='run under a grant a hook already waited for; queues as usual when it is gone')
     run.add_argument('argv', nargs=argparse.REMAINDER, help='-- command and arguments')
 
     st = sub.add_parser('status', help='sessions, runs and the queue')
     st.add_argument('--json', action='store_true')
+    st.add_argument('--line', action='store_true',
+                    help='one short line for a status line; prints nothing when the hub is not running')
+    st.add_argument('--session', help='for --line: whose share to show (default: session_id of the JSON on stdin, '
+                                      'as Claude Code passes it)')
 
     why = sub.add_parser('why', help='explain the decision about one run')
     why.add_argument('run', type=int)
@@ -43,6 +49,9 @@ def parser():
     ses.add_argument('--cwd')
     ses.add_argument('--title', default='')
 
+    hook = sub.add_parser('hook', help='a Claude Code hook: reads its JSON on stdin (used by the plugin)')
+    hook.add_argument('event', choices=('session-start', 'session-end', 'pre-tool-use', 'post-tool-use'))
+
     sub.add_parser('hub', help='run the hub in the foreground (systemd starts it through the socket)')
     for name in ('install', 'uninstall'):
         i = sub.add_parser(name, help=f'{name} the systemd user units')
@@ -55,6 +64,9 @@ def main(argv=None):
     if args.command == 'hub':
         from .hub import main as hub_main
         return hub_main()
+    if args.command == 'hook':
+        from . import claude
+        return claude.main(args.event)
     if args.command in ('install', 'uninstall'):
         from . import install
         return getattr(install, args.command)(runtime=args.runtime)

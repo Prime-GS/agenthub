@@ -29,9 +29,9 @@ Non-goals:
 | Component | Role |
 |---|---|
 | `agenthubd` | The hub (`agenthub hub`): one process per user, systemd user service, socket-activated. Holds sessions, runs, the queue; decides admission and shedding. |
-| `agenthub` | The client CLI: `run`, `status`, `why`, `stop`, `admissions`, `session start\|end\|prio`, `install`, `uninstall`. Runs commands in the caller's context. |
+| `agenthub` | The client CLI: `run`, `status`, `why`, `stop`, `admissions`, `session start\|end\|prio`, `hook`, `install`, `uninstall`. Runs commands in the caller's context. |
 | systemd units | `agenthub.socket`, `agenthub.service`, `agenthub.slice` and four class slices. |
-| Integrations | Claude Code plugin (hooks + status line), later an MCP server for other agents. |
+| Integrations | Claude Code plugin in `claude-code/` (hooks; `agenthub status --line` for the status line), later an MCP server for other agents. |
 
 ### 2.1 Slice layout
 
@@ -102,6 +102,18 @@ instead, and `--pool NAME` (repeatable) replaces the kind's pools. A command an 
 no rule runs directly and is not tracked; an explicit `agenthub run` is always tracked, as kind `other` when no
 rule matches. Examples of kinds: `build` (`tsc`, `npm run build`, `cargo build`, Gradle), `test` (`jest`,
 `pytest`, `go test`), `browser` (Playwright, Puppeteer), `emulator`, `stand` (long-lived dev servers).
+
+A config without a `kinds` key gets three built-in kinds, tried in this order: `browser` (Playwright, Puppeteer,
+`cypress run`; 1.5 GiB), `test` (`jest`, `vitest`, `pytest`, `mocha`, `rspec`, `phpunit`, `go test`, `cargo test`,
+`python -m pytest|unittest`, `npm|pnpm|yarn|bun [run] test`, `gradle|mvn test`; 1.5 GiB) and `build` (`tsc`,
+`webpack`, `rollup`, `vite build`, `next build`, `cargo build`, `go build`, Gradle, Maven, `make`, `cmake --build`,
+`ninja`, `npm|pnpm|yarn|bun [run] build`; 2 GiB). Without them every command would be light and the Claude Code
+plugin would route nothing. The tool has to stand where a command starts — at the line start or after `;`, `&&`,
+`||`, `|`, `(`, past `VAR=value` assignments, a wrapper (`env`, `nice`, `nohup`, `time`, `timeout N`, `npx`,
+`uv run`, `bash -c`) and a path — so `git commit -m 'fix make'` or `pip install pytest` stay light; a script name
+after it may follow a colon (`npm run test:unit`). `docker build` is left out: its memory is charged to the
+Docker daemon, not to the run's scope. A `[[kinds]]` list of one's own replaces the built-in one; `kinds = []`
+turns kinds off.
 
 ### 4.2 Estimates
 
@@ -221,7 +233,12 @@ QUEUE #1 run 43  p3→p2  browser  est 1.5 GiB (history)  waiting 6m03s: pool br
 
 `p3→p2` is a run that aged one class while it waited.
 
-`agenthub why <run>` explains one decision in full. `agenthub status --json` feeds status lines and dashboards.
+`agenthub why <run>` explains one decision in full. `agenthub status --json` feeds dashboards; `agenthub status
+--line` prints one short line for an agent's status line (`hub ▸ room 9.8 GiB · you p1 · 2 running · queue 3`) and
+prints nothing when no hub is running — it checks the hub's pid file next to the socket first (pid and start
+time, so a file left by a stopped hub names no live hub), so a status line that refreshes often never starts the
+hub through socket activation. It reads Claude Code's JSON from stdin for at most 1 s. A session that gave up waiting is told
+when the room it needed appears, through a news file its integration reads ([claude-code.md](claude-code.md#news)).
 
 ## 8. Reliability and failure modes
 
@@ -238,6 +255,8 @@ QUEUE #1 run 43  p3→p2  browser  est 1.5 GiB (history)  waiting 6m03s: pool br
 | Failure | Behaviour |
 |---|---|
 | Hub not reachable within 1 s, or silent for 5 s after accepting | client runs the command directly in its class slice, prints a warning; CPU weights still apply |
+| A Claude Code hook fails (no hub, broken config, unreadable settings, any error) | the hook prints nothing and exits 0: Claude Code runs the command as written |
+| A grant a hook waited for is not claimed (permission prompt denied or slow) | the grant is held for its `hold` (120 s), then dropped; a late `agenthub run --grant` queues again |
 | `systemd-run` or the user manager not available | client runs the command as a plain child process; the hub tracks it through the client's connection only, so a hub restart forgets it |
 | `systemd-run` slow to create the scope | the hub waits up to 30 s for the scope before it counts the run as ended |
 | Hub crashes during runs | runs keep going (they belong to systemd, not the hub); state rebuilt on restart |

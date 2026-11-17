@@ -55,6 +55,8 @@ class Run:
     estimate_source: str = 'default'
     shed: bool = False
     cpu_usec: int | None = None
+    hold: float | None = None     # how long a grant waits for a client that left (a hook that waited for it)
+    notify: bool = False          # tell the session when room appears after this run's wait ran out
 
     @property
     def memory_high(self):

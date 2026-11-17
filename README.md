@@ -5,9 +5,10 @@ command (build, test suite, headless browser, emulator, dev stand) asks it for r
 priority, and the kernel shares CPU between priorities by weight. Nobody needs a cron job, and a session that
 never heard of the others still cannot sink the machine.
 
-> **Status: milestones M1 (core hub) and M2 (pressure) work.** Sessions, a priority queue with admission by
-> memory, class slices, a fail-open client, PSI-driven pausing and shedding, learned estimates, pools and aging
-> run on a real systemd user manager. The Claude Code plugin comes next — see [docs/roadmap.md](docs/roadmap.md).
+> **Status: milestones M1–M3 work.** Sessions, a priority queue with admission by memory, class slices, a
+> fail-open client, PSI-driven pausing and shedding, learned estimates, pools, aging, and a Claude Code plugin
+> that routes builds and tests through the hub run on a real systemd user manager. Other agents come next — see
+> [docs/roadmap.md](docs/roadmap.md).
 > На русском — [README.ru.md](README.ru.md).
 
 ## The problem
@@ -91,6 +92,13 @@ agenthub why 3                               # one decision in full
 agenthub run --pool browser -- npx playwright test   # needs [pools] browser = N in the config
 agenthub admissions pause --reason demo      # hold new runs (running ones go on); resume lifts it
 agenthub uninstall
+```
+
+With Claude Code, start sessions with the plugin and nothing else changes — builds and tests the agent runs wait
+for room in the hub ([docs/claude-code.md](docs/claude-code.md)):
+
+```sh
+claude --plugin-dir ./claude-code
 ```
 
 Configuration lives in `~/.config/agenthub/config.toml` ([design §10](docs/design.md#10-configuration)); without

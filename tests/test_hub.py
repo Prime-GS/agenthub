@@ -564,7 +564,7 @@ class ClientTest(unittest.TestCase):
             self.addCleanup(hold.close)
             hold.call({'op': 'session.start', 'session': 'x', 'cwd': '/tmp'})
             hold.call({'op': 'run.request', 'session': 'x', 'cmd': 'held', 'cwd': '/tmp', 'estimate': '1M'})
-            self.assertEqual(client.cmd_status(argparse.Namespace(json=False)), 0)
+            self.assertEqual(client.cmd_status(argparse.Namespace(json=False, line=False)), 0)
             self.assertEqual(client.cmd_admissions(argparse.Namespace(action='resume', reason='x')), 0)
             self.assertEqual(client.cmd_admissions(argparse.Namespace(action=None, reason='x')), 0)
         text = out.getvalue()

@@ -39,7 +39,24 @@ class BuildTest(unittest.TestCase):
         self.assertEqual(cfg.classes['p0'].memory_low, 2 * GIB)
         self.assertEqual([cfg.classes[k].cpu_weight for k in c.CLASSES], [1000, 400, 100, 25])
         self.assertEqual(cfg.class_for_path('/nowhere'), ('p2', 'default'))
-        self.assertEqual((cfg.kind_for('make all').name, cfg.kind_for('make all').estimate), ('other', GIB))
+        self.assertEqual((cfg.kind_for('make all').name, cfg.kind_for('make all').estimate), ('build', 2 * GIB))
+        self.assertEqual([k.name for k in cfg.kinds], ['browser', 'test', 'build'])   # built in, first match wins
+        self.assertEqual(cfg.kind_for('npx playwright test').name, 'browser')
+        self.assertEqual(cfg.kind_for('ls -la').name, 'other')
+        heavy = {'cd api && make': 'build', '/usr/bin/make -j8': 'build', './gradlew test': 'test',
+                 'npm run test:unit': 'test', 'npm run build:prod': 'build', 'pnpm -r build': 'build',
+                 'NODE_ENV=production npm run build': 'build', 'time cargo build --release': 'build',
+                 'timeout 600 npm test': 'test', 'uv run pytest -x': 'test', 'python3 -m unittest -v': 'test',
+                 "bash -c 'make all'": 'build', '(cd web; npx vitest run)': 'test',
+                 'npm test 2>&1 | tail -20': 'test', 'git pull && npx playwright test': 'browser'}
+        for line, kind in heavy.items():
+            self.assertEqual(cfg.kind_for(line).name, kind, line)
+        for line in ("git commit -m 'fix make test'", 'pip install pytest', 'rg jest src', 'which tsc', 'man make',
+                     'echo make', 'cat Makefile', 'vim webpack.config.js', 'docker build .', 'maker', 'npm install'):
+            self.assertEqual(cfg.kind_for(line).name, 'other', line)
+        self.assertEqual(c.build({'kinds': []}, 32 * GIB).kind_for('make all').name, 'other')   # turned off
+        own = c.build({'kinds': [{'name': 'e2e', 'match': 'cypress'}]}, 32 * GIB)
+        self.assertEqual([k.name for k in own.kinds], ['e2e'])   # one's own list replaces the built-in one
 
     def test_rules(self):
         home = os.path.expanduser('~')

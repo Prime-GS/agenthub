@@ -15,6 +15,8 @@ import threading
 import time
 import unittest
 
+from agenthub import system
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PFX = 'agenthubtest'
 RUNTIME = os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}'
@@ -168,8 +170,13 @@ class Integration(unittest.TestCase):
         self.assertIn('queueing again', err)
 
     def test_4_fails_open(self):
+        self.assertTrue(system.hub_running(os.path.join(RUNTIME, f'{PFX}.sock')))   # the status line may ask it
         systemctl('stop', f'{PFX}.socket', f'{PFX}.service')
         self.addCleanup(systemctl, 'start', f'{PFX}.socket')
+        self.assertFalse(system.hub_running(os.path.join(RUNTIME, f'{PFX}.sock')))   # the file names a dead pid
+        line = self.cli('status', '--line', '--session', 'hi')
+        self.assertEqual((line.returncode, line.stdout), (0, ''))
+        self.assertEqual(systemctl('is-active', f'{PFX}.service').stdout.strip(), 'inactive')   # and it did not wake it
         out = self.cli('run', '--', 'sh', '-c', 'cat /proc/self/cgroup; exit 7')
         self.assertEqual(out.returncode, 7)
         self.assertIn('running without the hub', out.stderr)

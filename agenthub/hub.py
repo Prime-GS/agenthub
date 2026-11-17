@@ -18,6 +18,8 @@ from .scheduler import ACTIVE, Machine, Run, Scheduler, SchedulerError, run_from
 log = logging.getLogger('agenthub')
 TICK = 2.0
 GRANT_START_LIMIT = 15.0   # a granted run whose client is gone waits this long for its scope
+HOLD_LIMIT = 600.0         # the longest `hold` a request may ask for
+INTEREST_FOR = 1800.0      # a session that gave up waiting hears about free room for this long
 SCOPE_GRACE = 30.0         # a started run whose scope does not exist yet is not ended before this
 PROTOCOL = 1
 SESSION_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}')
@@ -77,6 +79,7 @@ class Hub:
         self.sample_every = pressure.WINDOW_US / 1e6
         self.sampled_at = None
         self.last_shed = None   # (run id, governor time) of the last victim
+        self.interests = {}     # (session, fingerprint) → (estimate, pools, until): waits that ran out
         self.conns = {}
         self.sent = {}
         self.watches = {}
@@ -196,6 +199,9 @@ class Hub:
         for run in self.sched.end_session(sid):
             self.reply_final(run, error('cancelled', f'run {run.id}: {why}'))
         self.remove(self.path('sessions', f'{sid}.json'))
+        self.remove(self.path('news', sid))
+        for key in [k for k in self.interests if k[0] == sid]:
+            del self.interests[key]
         self.schedule()
 
     # runs
@@ -253,7 +259,7 @@ class Hub:
             self.sched.mark_started(run.id, system.run_unit(self.pfx, run.id), None)
             self.save_run(run)
             self.watch_run(run)
-        elif self.clock() - (run.granted or 0) > GRANT_START_LIMIT:
+        elif self.clock() - (run.granted or 0) > (run.hold or GRANT_START_LIMIT):
             self.sched.finish(run.id, 'cancelled', reason='granted but never started')
             self.remove(self.path('runs', f'{run.id}.json'))
             self.schedule()
@@ -274,11 +280,16 @@ class Hub:
         if writer is not None:
             send(writer, message)
 
+    def grant_message(self, run):
+        return {'ok': True, 'state': 'granted', 'run': run.id, 'unit': system.run_unit(self.pfx, run.id),
+                'slice': system.class_slice(self.pfx, run.cls), 'memory_high': run.memory_high}
+
     def schedule(self):
         """Admits what fits and tells every waiting client its current position and reason."""
-        if not self.sched.queue():
+        if not self.sched.queue() and not self.interests:
             return
-        for run in self.sched.decide(self.read_machine()):
+        machine = self.read_machine()
+        for run in self.sched.decide(machine):
             self.save_run(run)
             writer = self.conns.get(run.id)
             if writer is None:
@@ -286,14 +297,42 @@ class Hub:
                 self.remove(self.path('runs', f'{run.id}.json'))
                 continue
             self.sent.pop(run.id, None)
-            send(writer, {'ok': True, 'state': 'granted', 'run': run.id, 'unit': system.run_unit(self.pfx, run.id),
-                          'slice': system.class_slice(self.pfx, run.cls), 'memory_high': run.memory_high})
+            send(writer, self.grant_message(run))
         for pos, run in enumerate(self.sched.queue(), 1):
             update = (pos, run.reason)
             writer = self.conns.get(run.id)
             if writer is not None and self.sent.get(run.id) != update:
                 self.sent[run.id] = update
                 send(writer, {'ok': True, 'state': 'queued', 'run': run.id, 'position': pos, 'reason': run.reason})
+        if self.interests:
+            self.tell_room(machine)
+
+    # news: a session whose wait ran out hears when the room it needed is there
+
+    def remember_interest(self, run):
+        if run.notify and run.session in self.sched.sessions:
+            self.interests[(run.session, run.fp)] = (run.estimate, tuple(run.pools), self.clock() + INTEREST_FOR)
+
+    def tell_room(self, machine):
+        """Room counts only when nothing else waits for it: the queue comes first."""
+        now, headroom, held = self.clock(), self.sched.room(machine)[2], self.sched.pool_use()
+        busy = self.sched.paused or self.sched.queue()
+        for (sid, fp), (estimate, pools, until) in list(self.interests.items()):
+            if now > until or sid not in self.sched.sessions:
+                del self.interests[(sid, fp)]
+                continue
+            if busy or estimate > headroom or any(len(held.get(p, [])) >= self.cfg.pools.get(p, 1) for p in pools):
+                continue
+            del self.interests[(sid, fp)]
+            what = fp.split(' @ ')[0] if fp else 'the command'
+            self.add_news(sid, f'agenthub: room for `{what}` ({configmod.format_size(estimate)}) is free now — '
+                               f'retry it')
+
+    def add_news(self, sid, line):
+        path = self.path('news', sid)
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        with open(path, 'a') as f:
+            f.write(line + '\n')
 
     # protocol
 
@@ -392,6 +431,13 @@ class Hub:
             raise SchedulerError('bad_request', 'kind must be a kind name')
         if pools is not None and not (isinstance(pools, list) and all(isinstance(p, str) for p in pools)):
             raise SchedulerError('bad_request', 'pools must be a list of pool names')
+        hold, notify = msg.get('hold'), msg.get('notify', False)
+        if hold is not None:
+            hold = configmod.parse_duration(hold, 'hold')
+            if not 0 < hold <= HOLD_LIMIT:
+                raise SchedulerError('bad_request', f'hold must be above 0 and at most {HOLD_LIMIT:.0f} s')
+        if not isinstance(notify, bool):
+            raise SchedulerError('bad_request', 'notify must be true or false')
         cwd = msg.get('cwd') or self.sched.session(sid).cwd
         fp = historymod.fingerprint(cmd, cwd)
         learned = self.history.estimate(fp) if self.history is not None and estimate is None else None
@@ -403,10 +449,25 @@ class Hub:
             kind=kind, pools=pools, learned=learned, fp=fp)
         if run.state == 'refused':
             return error('refused', run.reason, run=run.id)
+        run.hold, run.notify = hold, notify
         mine.add(run.id)
         self.conns[run.id] = writer
         self.schedule()
         return None
+
+    def op_run_claim(self, msg, writer, mine):
+        """Takes over a grant whose client left on purpose: a hook waited for it, the Bash call runs it."""
+        run = self.sched.run(int(msg['run']))
+        sid = session_arg(msg)
+        if run.state != 'granted':
+            return error('grant_gone', f'run {run.id} is {run.state}', run=run.id)
+        if run.session != sid:
+            return error('grant_gone', f'run {run.id} belongs to another session', run=run.id)
+        if run.id in self.conns:
+            return error('grant_gone', f'run {run.id} already has a client', run=run.id)
+        mine.add(run.id)
+        self.conns[run.id] = writer
+        return self.grant_message(run)
 
     def op_run_started(self, msg, writer, mine):
         rid = int(msg['run'])
@@ -591,6 +652,7 @@ class Hub:
         while True:
             await asyncio.sleep(self.tick_interval)
             for run in self.sched.expire():
+                self.remember_interest(run)
                 self.reply_final(run, error('wait_expired', f'run {run.id}: {run.reason}', run=run.id))
             for run in list(self.sched.active()):
                 if run.state == 'running':
@@ -632,6 +694,11 @@ class Hub:
         armed = [n for n, p in self.pressure_paths.items() if self.triggers is not None and self.triggers.armed(p)]
         log.info('pressure: triggers on %s; files sampled every 2 s', ', '.join(armed) or 'nothing yet')
         self.server = await asyncio.start_unix_server(self.handle, sock=sock)
+        pid_path = sock.getsockname() + '.pid' if isinstance(sock.getsockname(), str) else None
+        if pid_path:
+            # for callers that must not start the hub by connecting; the start time tells a reused pid apart
+            with open(pid_path, 'w') as f:
+                f.write(f'{os.getpid()} {system.started_at(os.getpid())}\n')
         ticker = asyncio.create_task(self.tick())
         system.notify('READY=1')
         log.info('serving (config %s, budget %s, reserve %s)', self.cfg.source,
@@ -641,6 +708,8 @@ class Hub:
         finally:
             ticker.cancel()
             self.server.close()
+            if pid_path:
+                self.remove(pid_path)
             if self.inotify is not None:
                 loop.remove_reader(self.inotify.fd)
                 self.inotify.close()

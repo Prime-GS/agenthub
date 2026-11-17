@@ -12,6 +12,24 @@ UNITS = {'': 1, 'K': 1 << 10, 'M': 1 << 20, 'G': 1 << 30, 'T': 1 << 40}
 SIZE = re.compile(r'^(\d+(?:\.\d+)?)\s*([KMGT]?)(?:i?B)?$', re.I)
 DURATION = re.compile(r'^(\d+(?:\.\d+)?)\s*(ms|s|m|h)?$')
 SECONDS = {'ms': 0.001, 's': 1, 'm': 60, 'h': 3600, None: 1}
+# used when the config has no `kinds` key at all: without them every command is light and an integration hook
+# routes nothing. A `[[kinds]]` list of one's own replaces them; `kinds = []` turns them off. First match wins.
+# The tool has to stand where a command starts: at the line start or after an operator, past `VAR=value`
+# assignments, wrappers and a path — so `git commit -m 'fix make'` or `pip install pytest` stay light.
+_START = (r'(?:^|[;&|(])\s*(?:\w+=\S*\s+)*'
+          r'(?:(?:env|nice|nohup|time|exec|xvfb-run|timeout\s+\S+|npx|bunx|(?:uv|poetry|pipenv|pdm|hatch)\s+run'
+          r'|(?:pnpm|yarn)\s+(?:exec|dlx))\s+|(?:ba|z)?sh\s+-c\s+["\']?)*(?:[\w.~-]*/)*')
+_END = r'(?=$|[\s;&|)\'":])'
+_NPM = r'(?:npm|pnpm|yarn|bun)(?:\s+-\S+)*\s+(?:run\s+)?'
+DEFAULT_KINDS = [
+    {'name': 'browser', 'estimate': '1.5G', 'match': _START + r'(?:playwright|puppeteer|cypress run)' + _END},
+    {'name': 'test', 'estimate': '1.5G',
+     'match': _START + r'(?:jest|vitest|pytest|mocha|rspec|phpunit|go test|cargo test|python3? -m (?:pytest|unittest)'
+              r'|(?:gradlew?|mvnw?) test|' + _NPM + r'test)' + _END},
+    {'name': 'build', 'estimate': '2G',   # not `docker build`: its memory is charged to the Docker daemon
+     'match': _START + r'(?:tsc|webpack|rollup|vite build|next build|cargo build|go build|gradlew?|mvnw?|make'
+              r'|cmake --build|ninja|' + _NPM + r'build)' + _END},
+]
 
 
 class ConfigError(Exception):
@@ -217,7 +235,7 @@ def build(data, total, source='(defaults)'):
         if rule['class'] not in CLASSES:
             raise ConfigError(f'{at}: unknown class {rule["class"]!r}')
         cfg.projects.append(ProjectRule(os.path.expanduser(rule['path']), rule['class']))
-    for i, kind in enumerate(expect(data.get('kinds', []), list, f'{where}: kinds', 'a list of [[kinds]]')):
+    for i, kind in enumerate(expect(data.get('kinds', DEFAULT_KINDS), list, f'{where}: kinds', 'a list of [[kinds]]')):
         at = f'{where}: kinds[{i}]'
         if not isinstance(kind, dict) or 'name' not in kind or 'match' not in kind:
             raise ConfigError(f'{at}: needs both "name" and "match"')

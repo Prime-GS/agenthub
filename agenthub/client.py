@@ -2,6 +2,7 @@
 import json
 import os
 import queue
+import select
 import shlex
 import signal
 import socket
@@ -254,6 +255,14 @@ def cmd_run(args):
         conn = connect(pfx)
     except OSError as e:
         return run_direct(argv, cwd, f'hub not reachable ({e.strerror or e})', pfx)
+    if getattr(args, 'grant', None) is not None:
+        try:
+            claimed = conn.call({'op': 'run.claim', 'run': args.grant, 'session': sid})
+        except (HubLost, ValueError):
+            claimed = {'ok': False, 'error': {'message': 'the hub did not answer'}}
+        if claimed.get('state') == 'granted':
+            return finish_run(conn, claimed, argv, pfx)
+        say(f'grant {args.grant} is gone ({claimed.get("error", {}).get("message")}); queueing again')
     registered = reconnects = 0
     while True:
         try:
@@ -290,10 +299,14 @@ def cmd_run(args):
             say(f'{err["message"]}')   # a wrong --kind or --pool is the caller's mistake, not a broken hub
             return 2
         return run_direct(argv, cwd, f'hub answered {err["code"]}: {err["message"]}', pfx)
-    code, stopped = execute(conn, answer, argv, pfx)
+    return finish_run(conn, answer, argv, pfx)
+
+
+def finish_run(conn, grant, argv, pfx):
+    code, stopped = execute(conn, grant, argv, pfx)
     conn.close()
     if stopped:
-        say(f'run {answer["run"]} was stopped by the hub: {stopped}')
+        say(f'run {grant["run"]} was stopped by the hub: {stopped}')
         return EX_TEMPFAIL
     return code
 
@@ -357,7 +370,67 @@ def print_status(st):
               f'waiting {age(now - q["requested"])}: {q["reason"]}  ·  {short(q["cmd"], 50)}')
 
 
+def status_line(st, sid):
+    """`hub ▸ room 9.8 GiB · you p1 · 2 running · 1 queued · queue 3 · paused`."""
+    m = st['machine']
+    parts = [f'hub ▸ room {format_size(max(m["headroom"], 0))}']
+    session = next((s for s in st['sessions'] if s['id'] == sid), None)
+    if session is not None:
+        parts.append(f'you {session["class"]}')
+        running = sum(1 for r in st['runs'] if r['session'] == sid)
+        queued = sum(1 for q in st['queue'] if q['session'] == sid)
+        parts += [f'{running} running'] if running else []
+        parts += [f'{queued} queued'] if queued else []
+    if st['queue']:
+        parts.append(f'queue {len(st["queue"])}')
+    if m.get('admissions', {}).get('state') == 'paused':
+        parts.append('paused')
+    return ' · '.join(parts)
+
+
+def piped_input(limit=1.0):
+    """What the caller pipes in, read until end of file or for `limit` seconds: a pipe left open must not hang."""
+    deadline, chunks = time.monotonic() + limit, []
+    try:
+        fd = sys.stdin.fileno()
+        if os.isatty(fd):
+            return b''
+        while (left := deadline - time.monotonic()) > 0 and select.select([fd], [], [], left)[0]:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    except (OSError, ValueError):
+        pass
+    return b''.join(chunks)
+
+
+def cmd_status_line(args):
+    """For a status line that refreshes often: never starts the hub, never waits long, never fails loudly."""
+    sid = args.session
+    if sid is None:
+        try:
+            sid = json.loads(piped_input()).get('session_id')
+        except (ValueError, AttributeError):
+            sid = None
+    path = system.socket_path(system.prefix())
+    if not system.hub_running(path):
+        return 0
+    try:
+        conn = Conn(path)
+        conn.sock.settimeout(1.0)
+        st = conn.call({'op': 'status'})
+        conn.close()
+    except (OSError, HubLost, ValueError):
+        return 0
+    if st.get('ok'):
+        print(status_line(st, sid))
+    return 0
+
+
 def cmd_status(args):
+    if args.line:
+        return cmd_status_line(args)
     st = request({'op': 'status'})
     if st is None:
         return 1

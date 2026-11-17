@@ -101,6 +101,10 @@ def uninstall(runtime=False):
     if not runtime and os.path.exists(wrapper_path()):
         os.unlink(wrapper_path())
     shutil.rmtree(system.state_dir(pfx), ignore_errors=True)
+    try:
+        os.unlink(system.socket_path(pfx) + '.pid')   # a stopped hub leaves it; nothing reads a stale one
+    except FileNotFoundError:
+        pass
     system.systemctl('daemon-reload')
     system.systemctl('reset-failed', f'{pfx}.socket', f'{pfx}.service')
     base = system.Cgroups(pfx).base
