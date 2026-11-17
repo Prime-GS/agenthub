@@ -93,7 +93,7 @@ class Cgroups:
         except OSError:
             return found
         for name in slices:
-            m = re.match(rf'^{self.pfx}-(p\d)\.slice$', name)
+            m = re.match(rf'^{self.pfx}-(p[0-3])\.slice$', name)   # the classes of config.CLASSES
             if not m:
                 continue
             directory = os.path.join(self.base, name)
@@ -142,10 +142,11 @@ def cpu_usage_usec(directory):
     return read_keyed(os.path.join(directory, 'cpu.stat')).get('usage_usec')
 
 
-def pressure(resource='memory'):
+def pressure(path='/proc/pressure/memory'):
+    """{'some': {'avg10': …, 'total': …}, 'full': {…}} from a pressure file; empty when it is not there."""
     out = {}
     try:
-        with open(f'/proc/pressure/{resource}') as f:
+        with open(path) as f:
             for line in f:
                 kind, *fields = line.split()
                 out[kind] = {k: float(v) for k, v in (x.split('=') for x in fields)}
@@ -178,7 +179,7 @@ def can_make_scopes():
 
 def scope_argv(unit, slice_name, memory_high, argv):
     return ['systemd-run', '--user', '--scope', '--quiet', '--collect', f'--unit={unit}', f'--slice={slice_name}',
-            '-p', f'MemoryHigh={memory_high}', '--', *argv]
+            '-p', f'MemoryHigh={memory_high}', '-p', 'TimeoutStopSec=10s', '--', *argv]
 
 
 def in_unit(pid, unit):

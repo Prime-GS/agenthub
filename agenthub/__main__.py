@@ -11,7 +11,11 @@ def parser():
 
     run = sub.add_parser('run', help='run a heavy command through the hub')
     run.add_argument('--session', help='session id (default: $AGENTHUB_SESSION, else the calling shell)')
-    run.add_argument('--estimate', help='expected peak memory, e.g. 2G (default: from kind rules)')
+    run.add_argument('--estimate', help='expected peak memory, e.g. 2G (default: learned from past runs, '
+                                        'else from kind rules)')
+    run.add_argument('--kind', help='kind name from the config (default: matched from the command line)')
+    run.add_argument('--pool', action='append', metavar='NAME',
+                     help='take one unit of this pool while running; repeatable (default: the kind\'s pools)')
     run.add_argument('--wait', help='longest time to wait in the queue, e.g. 10m (default: no limit)')
     run.add_argument('--shell', help='run this command line with bash -c instead of argv')
     run.add_argument('argv', nargs=argparse.REMAINDER, help='-- command and arguments')
@@ -21,6 +25,10 @@ def parser():
 
     why = sub.add_parser('why', help='explain the decision about one run')
     why.add_argument('run', type=int)
+
+    adm = sub.add_parser('admissions', help='pause or resume starting new runs (running ones are not touched)')
+    adm.add_argument('action', nargs='?', choices=('pause', 'resume'), help='without it: show the state')
+    adm.add_argument('--reason', default='paused by hand')
 
     stop = sub.add_parser('stop', help='stop a run (or take it out of the queue)')
     stop.add_argument('run', type=int)

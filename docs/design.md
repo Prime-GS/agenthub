@@ -29,7 +29,7 @@ Non-goals:
 | Component | Role |
 |---|---|
 | `agenthubd` | The hub (`agenthub hub`): one process per user, systemd user service, socket-activated. Holds sessions, runs, the queue; decides admission and shedding. |
-| `agenthub` | The client CLI: `run`, `status`, `why`, `stop`, `session start\|end\|prio`, `install`, `uninstall`. Runs commands in the caller's context. |
+| `agenthub` | The client CLI: `run`, `status`, `why`, `stop`, `admissions`, `session start\|end\|prio`, `install`, `uninstall`. Runs commands in the caller's context. |
 | systemd units | `agenthub.socket`, `agenthub.service`, `agenthub.slice` and four class slices. |
 | Integrations | Claude Code plugin (hooks + status line), later an MCP server for other agents. |
 
@@ -87,26 +87,41 @@ A run is one heavy command.
 3. On `grant` the client starts the command with `systemd-run --user --scope` in the class slice, under the
    run's unit name and `MemoryHigh`, and reports `started` with the scope name.
 4. The hub watches the scope's `cgroup.events` (populated → 0, through inotify) to learn that the run ended,
-   whoever started it, reads `memory.peak` and `cpu.stat`, and records them in the history (M2). The peak is
-   best effort: systemd may remove the scope before the hub reads it.
+   whoever started it. It reads the scope's `memory.peak` and `cpu.stat` every 2 s while the run lives and once
+   more at its end, so the peak survives systemd removing the scope first, and writes one history row when the
+   run becomes ended (§4.2).
 5. The client exits with the command's exit code. If the hub stopped the run, or the run's `wait` passed in
    the queue, the client exits with **75** (`EX_TEMPFAIL`) and prints why, so the agent sees the reason in the
    command's own output. Signals sent to the client (TERM, INT, HUP) are passed on to the command.
 
 ### 4.1 Which commands are heavy
 
-Commands are classified by rules in the config (regular expression on the command line → kind, default
-estimate, pools, class adjustment). A command an integration hook sees that matches no rule runs directly
-and is not tracked; an explicit `agenthub run` is always tracked, as kind `other` when no rule matches. Examples of kinds:
-`build` (`tsc`, `npm run build`, `cargo build`, Gradle), `test` (`jest`, `pytest`, `go test`), `browser`
-(Playwright, Puppeteer), `emulator`, `stand` (long-lived dev servers).
+Commands are classified by rules in the config (regular expression on the command line → kind, default estimate,
+pools; a class adjustment per kind is planned, not implemented). `agenthub run --kind NAME` names the kind
+instead, and `--pool NAME` (repeatable) replaces the kind's pools. A command an integration hook sees that matches
+no rule runs directly and is not tracked; an explicit `agenthub run` is always tracked, as kind `other` when no
+rule matches. Examples of kinds: `build` (`tsc`, `npm run build`, `cargo build`, Gradle), `test` (`jest`,
+`pytest`, `go test`), `browser` (Playwright, Puppeteer), `emulator`, `stand` (long-lived dev servers).
 
 ### 4.2 Estimates
 
 The expected peak memory of a run comes from, in order: an explicit `--estimate`; the 90th percentile of
-`memory.peak` over the last 20 runs with the same fingerprint (program, subcommand, project root); the kind's
-default from the config; the global `default_estimate` (1 GiB). Estimates are kept in a SQLite file under
-`$XDG_STATE_HOME`. M1 uses the explicit estimate, the kind default and the global default; history comes in M2.
+`memory.peak` over the last 20 runs with the same fingerprint; the kind's default from the config; the global
+`default_estimate` (1 GiB). `status` and `why` show which one was used (`explicit`, `history`, `kind build`,
+`default`).
+
+- **Fingerprint:** program, subcommand and project root, e.g. `npm run build @ /home/u/work/api`. The program is
+  found after `VAR=value` prefixes and wrappers (`env` with its options, `npx`, `time`, `nohup`, `timeout N`,
+  `taskset -c LIST`, `nice -n N`, `ionice -c N`), with redirections (`> log`, `2>&1`) left out; the subcommand is
+  the first word that is not an option (two for `run X` and `exec X`); the project root is the nearest directory
+  upwards that holds `.git`, else the cwd. For a shell line (`--shell`, `sh -c`) it is the last command after `;`,
+  `&&`, `||` that is not `cd`, and the first stage of a pipeline.
+- **Shed runs** count as their peak × 1.5: a run stopped under pressure needed more than it reached.
+- A learned estimate is capped at the agent budget, so history alone never makes a command refused.
+- **History file:** `$XDG_STATE_HOME/agenthub/history.sqlite3` (mode 0600). One row per ended run whose peak
+  is known: fingerprint, class, kind, estimate, peak, CPU seconds, duration, shed or not; the last 50 per
+  fingerprint are kept. The exit code is not stored: it arrives after the run has ended. A broken or locked
+  file costs only the learned estimates. `agenthub uninstall` leaves the file and prints its path.
 
 ### 4.3 Long-lived runs
 
@@ -122,7 +137,7 @@ free      = min(MemAvailable − reserve,
                 agent_budget − memory.current(agenthub.slice))
 growth    = Σ over running runs of max(0, estimate − memory.current(run))
 headroom  = free − growth
-grant if  estimate ≤ headroom  and every pool the run needs has a free unit
+grant if  admissions are open  and  estimate ≤ headroom  and  every pool the run needs has a free unit
 ```
 
 A run whose estimate is above the whole `agent_budget` is refused at once instead of waiting forever. The hub
@@ -139,28 +154,47 @@ Ordering:
 - **No memory backfill:** if the head of the queue does not fit in memory, smaller runs behind it do not jump
   ahead. Otherwise a stream of small runs would starve a large high-priority one.
 - **Pool backfill is allowed:** if the head waits for a pool (for example the only emulator), runs that do not
-  need that pool may start.
+  need that pool may start. A unit is held from grant to end; runs behind it that need the same pool wait
+  behind it.
+- Aging changes only the place in the queue; the run still starts in the slice of its own class, and a running
+  run is shed by its own class.
 
-M1 implements the memory rule, class order and no memory backfill; aging and pools come with M2.
-
-Every `queued` answer carries the reason: `needs 3.1 GiB, 1.2 GiB above reserve`, `pool emulator 1/1 held by
-session B`, `memory pressure — admissions paused`.
+Every `queued` answer carries the reason, the first that applies: a pause (`memory pressure — admissions
+paused`, `admissions paused by hand (…)`), memory (`needs 3.1 GiB, 1.2 GiB above reserve`, or `behind run 41
+(p1, needs 2.0 GiB)` for the runs behind it), a pool (`pool emulator 1/1 held by run 41`, or `behind run 43 for
+pool emulator`).
 
 ## 6. Pressure handling
 
-The hub opens PSI triggers on `/proc/pressure/memory` and on `agenthub.slice/memory.pressure`:
+The hub opens PSI triggers on `agenthub.slice/memory.pressure` and on `/proc/pressure/memory` (the second can
+be turned off with `machine.system_pressure = false`). It also reads the `total` stall times of the same files
+every 2 s and acts on the difference, which is all it has when the kernel refuses triggers (before 6.5, or a
+file it may not write) and catches what a trigger missed while the slice's cgroup did not exist:
 
-| Trigger | Meaning | Action |
+| Stall | Meaning | Action |
 |---|---|---|
 | `some` ≥ 150 ms per 2 s | tasks are stalling on memory | pause admissions |
 | `full` ≥ 50 ms per 2 s, or `MemAvailable` < reserve / 2 | the machine is about to thrash | shed one run |
-| no trigger for 30 s and headroom > 0 | calm | resume admissions, wake the queue |
+| none for 30 s and headroom > 0 | calm | resume admissions, wake the queue |
 
-**Shedding** picks one victim: the lowest effective class, then the most recently started run (it has lost
-the least work), skipping runs of non-preemptible classes (`p0` by default). The hub writes the reason to the
-run's client, stops the scope (`SIGTERM`, then `SIGKILL` after 10 s), records the peak so the next estimate is
-higher, and waits a cooldown (10 s) before it may shed again. One victim at a time: stopping one build usually
-ends the pressure, and stopping three would throw away work for nothing.
+A stall counts only when memory is actually short: agent work uses at least 90 % of its budget, or
+`MemAvailable` is below the reserve. A run that outgrows its own `MemoryHigh` on an otherwise roomy machine
+stalls itself, and stopping other runs would not help it. `MemAvailable` below half the reserve sheds on its
+own.
+
+The pause shows as the reason of every queued run and in `status`. `agenthub admissions pause|resume` sets
+and lifts a pause by hand; it is kept in the state directory, survives a hub restart and does not lift itself.
+A pressure pause is not kept: after a restart the hub finds the pressure again.
+
+**Shedding** picks one victim among the running runs: the lowest class, then the most recently started run (it has
+lost the least work), skipping runs of non-preemptible classes (`p0` by default), runs already being stopped, and
+runs the hub cannot stop (no scope and no client) or whose scope is already empty. The hub tells the run's client
+why (`shed: memory full-pressure 74 ms/2 s (agents); lowest class, newest run`), stops the scope the same way as
+`run.stop` (`SIGTERM`, then `SIGKILL` after 10 s through the scope's `TimeoutStopSec`), marks the run shed so its
+history row raises the next estimate, and waits a cooldown (10 s) before it may shed again, and longer while the
+victim is still alive (up to 20 s: a run that ignores `SIGTERM` keeps its memory until the `SIGKILL`). One victim
+at a time: stopping one build usually ends the pressure, and stopping three would throw away work for nothing.
+With no candidate the hub only pauses.
 
 **Freezing is not used for memory.** A frozen cgroup keeps its memory; pausing a run does not relieve memory
 pressure. Freezing is only a possible future option for CPU-bound background runs.
@@ -173,15 +207,19 @@ pressure; it does not regulate CPU in user space.
 `agenthub status` prints the machine and the queue:
 
 ```
-machine   31.0 GiB  available 9.8 GiB  reserve 4.0 GiB  psi mem some 2 % full 0 %  cpu 63 %
-SESSION     AGENT        CLASS  PROJECT         RUNS
-a1f3…       claude-code  p1     ~/work/api      2
-9c02…       claude-code  p3     ~/hobby/game    0 (1 queued)
-RUN   SESSION  CLASS  KIND     MEM now/peak/est     CPU   AGE    COMMAND
-41    a1f3…    p1     build    1.9/2.3/2.5 GiB      310%  1m12s  npm run build
-42    a1f3…    p1     test     0.8/0.8/1.4 GiB      95%   0m20s  jest src/orders
-QUEUE 43  9c02…  p3  browser  est 1.5 GiB  waiting 2m: pool browser 2/2 held (41, 42)
+machine  31.0 GiB  available 9.8 GiB  reserve 4.0 GiB  budget 27.0 GiB  agents 2.7 GiB  headroom 4.1 GiB
+pressure memory some 2% full 0%  agents some 5% full 0%  cpu some 63%  admissions open
+pools    browser 2/2  emulator 0/1
+SESSION          AGENT        CLASS WHY                        CWD
+a1f3…            claude-code  p1    project rule ~/work/**     ~/work/api
+9c02…            claude-code  p3    project rule ~/hobby/**    ~/hobby/game
+RUN   SESSION          CLASS KIND     MEM now/est             CPU     AGE  COMMAND
+41    a1f3…            p1    build    1.9 GiB/2.5 GiB        310%   1m12s  npm run build
+42    a1f3…            p1    browser  819 MiB/1.4 GiB         95%   0m20s  npx playwright test
+QUEUE #1 run 43  p3→p2  browser  est 1.5 GiB (history)  waiting 6m03s: pool browser 2/2 held by run 41, 42  ·  npx playwright test
 ```
+
+`p3→p2` is a run that aged one class while it waited.
 
 `agenthub why <run>` explains one decision in full. `agenthub status --json` feeds status lines and dashboards.
 
@@ -208,7 +246,8 @@ QUEUE 43  9c02…  p3  browser  est 1.5 GiB  waiting 2m: pool browser 2/2 held (
 | Client gone between grant and start, or hub restarted then | the run is adopted as soon as its scope runs; the grant is dropped after 15 s if it never does |
 | Client killed while running | the scope lives on until the command ends; the hub still accounts it |
 | Agent session crashes | pidfd closes; queued requests dropped; running runs finish |
-| PSI triggers unavailable (kernel < 6.5) | hub samples pressure files every 2 s while any run is active |
+| PSI triggers unavailable (kernel < 6.5, or the file refuses them) | the 2-second sampling of the pressure files, which runs anyway, is the only source |
+| History file broken or locked | estimates come from the kind and the default; the hub logs a warning |
 | Config error | hub exits with 78 and names the file, line and key; systemd does not restart it; clients fail open |
 
 ## 9. Security
@@ -217,8 +256,10 @@ QUEUE 43  9c02…  p3  browser  est 1.5 GiB  waiting 2m: pool browser 2/2 held (
   `SO_PEERCRED` so only the same uid can talk to it.
 - The hub never executes commands. It only grants, observes, and stops units named `agenthub-run-*` that a
   client of the same user registered.
-- Command lines are stored in the local history for estimates; they may contain secrets passed on the command
-  line, so the history file is mode 0600 and can be limited to the program and subcommand.
+- The history for estimates stores only the fingerprint (program, subcommand, project root), never the whole
+  command line, so secrets passed as arguments do not reach the disk; the file is mode 0600 anyway. Command
+  lines of live runs are kept in the hub's memory and its runtime directory (`$XDG_RUNTIME_DIR`, memory-backed);
+  the hub's journal names a shed run by its fingerprint.
 
 ## 10. Configuration
 
@@ -230,7 +271,8 @@ desktop_reserve = "4G"      # never handed to agent work (default 15 %)
 agent_budget = "auto"       # RAM minus desktop_reserve
 default_estimate = "1G"     # a run with no estimate and no matching kind
 idle_exit = "10m"           # the hub exits when idle; the socket starts it again
-aging_step = "5m"           # M2
+aging_step = "5m"           # a waiting run rises one class per this much waiting, up to p1
+system_pressure = true      # also react to /proc/pressure/memory, not only to the agent slice
 
 [classes]
 p0 = { cpu_weight = 1000, memory_low = "2G", preemptible = false }
@@ -263,10 +305,10 @@ estimate = "1.5G"
 pools = ["browser"]
 ```
 
-Sizes take `K/M/G/T` (binary) or a percentage of RAM; durations take `ms/s/m/h`. Pools, aging and
-`preemptible` are read from M2 on. `$AGENTHUB_CONFIG` points to another file; `$AGENTHUB_PREFIX` renames the
-units, the socket and the state directory (the tests use `agenthubtest`). The slice limits are written into the
-unit files at `agenthub install`, so a changed budget needs `agenthub install` again.
+Sizes take `K/M/G/T` (binary) or a percentage of RAM; durations take `ms/s/m/h`. A pool has 1 to 1000 units, and a
+kind may name only pools declared under `[pools]`. `$AGENTHUB_CONFIG` points to another file; `$AGENTHUB_PREFIX`
+renames the units, the socket and the state directory (the tests use `agenthubtest`). The slice limits are written
+into the unit files at `agenthub install`, so a changed budget needs `agenthub install` again.
 
 ## 11. Language and size
 
@@ -277,10 +319,13 @@ plain JSON lines.
 
 ## 12. Testing
 
-M1 ships three layers: `tests/test_config.py` and `tests/test_scheduler.py` (pure logic), `tests/test_hub.py`
-(the hub over its socket with fake memory readings and a fake cgroup tree), and `tests/test_integration.py`
-(the real user manager, only with `AGENTHUB_IT=1`: prefix `agenthubtest`, a 600 MiB budget, `sleep` and CPU
-burners pinned to one core). The plan for all milestones:
+Three layers: `tests/test_config.py`, `tests/test_scheduler.py` and `tests/test_pressure.py` (pure logic:
+admission, aging, pools, victim choice, fingerprints, the pressure governor with a fake clock),
+`tests/test_hub.py` (the hub over its socket with fake memory readings, a fake cgroup tree and fake pressure
+files), and `tests/test_integration.py` (the real user manager, only with `AGENTHUB_IT=1`: prefix
+`agenthubtest`, a 600 MiB budget, `sleep`, CPU burners pinned to one core, and a memory storm of three hogs
+with swap turned off for the test slice, which must shed exactly the newest `p3` run while a probe standing in
+for the desktop keeps its 50 ms rhythm). The plan for all milestones:
 
 - **Scheduler core as pure functions:** admission, ordering, aging, backfill and victim choice are tested with a
   fake clock and fake memory readings.

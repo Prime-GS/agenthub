@@ -6,6 +6,7 @@ import shutil
 import sys
 
 from . import config as configmod
+from . import history
 from . import system
 from .config import CLASSES
 
@@ -113,4 +114,6 @@ def uninstall(runtime=False):
         # stopping a slice stops everything in it, so only once nothing runs there
         system.systemctl('stop', *(system.class_slice(pfx, c) for c in CLASSES), system.root_slice(pfx))
         print(f'removed {removed} units from {directory}')
+    if os.path.exists(history.default_path(pfx)):
+        print(f'kept the learned estimates in {history.default_path(pfx)}; delete the file to forget them')
     return 0

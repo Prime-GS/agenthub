@@ -1,6 +1,8 @@
 """The hub over its real socket protocol, with fake memory readings and a fake cgroup tree in a temp dir."""
 import argparse
 import asyncio
+import contextlib
+import io
 import os
 import shutil
 import socket
@@ -11,7 +13,7 @@ import time
 import unittest
 from unittest import mock
 
-from agenthub import client, config as c, system
+from agenthub import client, config as c, history, pressure, system
 from agenthub.hub import Hub, listening_socket
 from agenthub.scheduler import Machine
 
@@ -22,13 +24,27 @@ PFX = 'agenthubtest'
 class World:
     """A temp dir holding the socket, the state dir and a fake cgroup tree."""
 
-    def __init__(self, budget=1000 * M):
+    def __init__(self, budget=1000 * M, reserve=0, **extra):
         self.dir = tempfile.mkdtemp(prefix='agenthub-test-')
         self.sock = os.path.join(self.dir, 'hub.sock')
         self.state = os.path.join(self.dir, 'state')
-        self.cfg = c.build({'machine': {'agent_budget': budget, 'desktop_reserve': 0, 'idle_exit': '1h'}}, 8000 * M)
+        self.cfg = c.build(dict({'machine': {'agent_budget': budget, 'desktop_reserve': reserve, 'idle_exit': '1h'}},
+                                **extra), 8000 * M)
         self.available = 8000 * M
+        self.agent_current = 0
         self.stopped = []
+        # fake pressure files: the live machine's pressure must not steer unit tests
+        self.pressure = {name: os.path.join(self.dir, f'{name}.pressure') for name in ('agents', 'system')}
+        for name in self.pressure:
+            self.stall(name, 0, 0)
+        self.history_path = os.path.join(self.dir, 'history', 'history.sqlite3')
+
+    def stall(self, name, some, full):
+        # replaced, not rewritten in place: a sample that read the truncated file would lose its baseline
+        with open(self.pressure[name] + '.new', 'w') as f:
+            f.write(f'some avg10=0.00 avg60=0.00 avg300=0.00 total={some}\n'
+                    f'full avg10=0.00 avg60=0.00 avg300=0.00 total={full}\n')
+        os.replace(self.pressure[name] + '.new', self.pressure[name])
 
     def cgroups(self):
         cg = system.Cgroups(PFX, base='/')
@@ -47,12 +63,13 @@ class World:
         return d
 
     def machine(self):
-        return Machine(self.available, 0, {})
+        return Machine(self.available, self.agent_current, {})
 
     def start(self, tick=0.1):
         hub = Hub(self.cfg, PFX, self.cgroups(), self.state, stop_unit=self.stopped.append,
-                  read_machine=self.machine)
-        hub.tick_interval = tick
+                  read_machine=self.machine, history=history.History(self.history_path),
+                  pressure_paths=self.pressure, use_triggers=False)
+        hub.tick_interval = hub.sample_every = tick
         sock = listening_socket(self.sock)
         hub.crashed = None
 
@@ -295,6 +312,186 @@ class RestartTest(unittest.TestCase):
         self.assertTrue(until(lambda: hub2.sched.runs[grant['run']].state == 'running'))
 
 
+class Clock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+class PressureTest(unittest.TestCase):
+    """Shedding, pausing and resuming over the socket, driven by fake pressure files and a fake governor clock."""
+
+    def setUp(self):
+        self.w = World(reserve=1000 * M, pools={'browser': 1})
+        self.addCleanup(self.w.cleanup)
+        self.hub, self.thread = self.w.start()
+        self.addCleanup(self.w.stop, self.hub, self.thread)
+        self.clock = Clock()
+        self.hub.governor.clock = self.clock
+        self.admin = self.w.conn()
+        self.addCleanup(self.admin.close)
+        for sid, cls in (('top', 'p0'), ('a', 'p1'), ('z', 'p3')):
+            self.admin.call({'op': 'session.start', 'session': sid, 'agent': 'test', 'cwd': '/tmp'})
+            self.admin.call({'op': 'session.prio', 'session': sid, 'class': cls})
+
+    def running(self, sid, cls, cmd='work', **extra):
+        conn = self.w.conn()
+        self.addCleanup(conn.close)
+        grant = conn.call(dict({'op': 'run.request', 'session': sid, 'cmd': cmd, 'cwd': '/tmp', 'estimate': '50M'},
+                               **extra))
+        self.assertEqual(grant['state'], 'granted', grant)
+        self.w.scope(cls, grant['run'])
+        conn.send({'op': 'run.started', 'run': grant['run'], 'unit': grant['unit'], 'pid': os.getpid()})
+        self.assertTrue(until(lambda: self.hub.sched.runs[grant['run']].state == 'running'))
+        return conn, grant
+
+    def test_full_pressure_sheds_the_newest_lowest_run_once_then_calm_resumes(self):
+        self.running('top', 'p0')
+        _, a = self.running('a', 'p1')
+        old_conn, old = self.running('z', 'p3')
+        new_conn, new = self.running('z', 'p3')
+        self.w.agent_current = 950 * M   # agents near their 1000M budget: pressure counts
+        self.w.stall('agents', 10_000_000, 10_000_000)
+        stopping = new_conn.recv()
+        self.assertEqual((stopping['state'], stopping['run']), ('stopping', new['run']))
+        self.assertRegex(stopping['reason'], r'^shed: memory full-pressure \d+ ms/2 s \(agents\); lowest class, newest run$')
+        self.assertTrue(until(lambda: self.w.stopped == [new['unit']]))
+        # still hot inside the cooldown: no second victim, and new requests wait
+        self.w.stall('agents', 20_000_000, 20_000_000)
+        waiting = self.w.conn()
+        self.addCleanup(waiting.close)
+        queued = waiting.call({'op': 'run.request', 'session': 'a', 'cmd': 'next', 'cwd': '/tmp', 'estimate': '1M'})
+        self.assertEqual((queued['state'], queued['reason']), ('queued', pressure.PAUSED))
+        time.sleep(0.5)
+        self.assertEqual(self.w.stopped, [new['unit']])
+        ended = new_conn.call({'op': 'run.ended', 'run': new['run'], 'exit': 143})
+        self.assertTrue(ended['stopped'].startswith('shed: '))
+        self.assertEqual(history.History(self.w.history_path).estimate(self.hub.sched.runs[new['run']].fp),
+                         int(20 * M * history.SHED_FACTOR))
+        # the next shed after the cooldown takes the other p3, never p0
+        self.clock.t += pressure.COOLDOWN
+        self.w.stall('agents', 30_000_000, 30_000_000)
+        self.assertEqual(old_conn.recv()['run'], old['run'])
+        # past the cooldown, but the victim ignores TERM and still holds its memory: nobody else is shed
+        self.clock.t += pressure.COOLDOWN
+        self.w.stall('agents', 40_000_000, 40_000_000)
+        time.sleep(0.5)
+        self.assertEqual(len(self.w.stopped), 2)
+        self.assertEqual(self.admin.call({'op': 'admissions'})['state'], 'paused')
+        self.w.end_scope('p3', old['run'])
+        self.assertTrue(until(lambda: self.hub.sched.runs[old['run']].state == 'ended'))
+        self.clock.t += pressure.COOLDOWN
+        self.w.stall('agents', 50_000_000, 50_000_000)
+        self.assertTrue(until(lambda: len(self.w.stopped) == 3))
+        self.assertEqual(self.w.stopped[2], a['unit'])
+        self.w.end_scope('p1', a['run'])
+        self.assertTrue(until(lambda: self.hub.sched.runs[a['run']].state == 'ended'))
+        self.clock.t += pressure.COOLDOWN
+        self.w.stall('agents', 60_000_000, 60_000_000)
+        time.sleep(0.5)
+        self.assertEqual(len(self.w.stopped), 3)  # only p0 is left
+        # memory freed and calm for long enough: the queue moves again
+        self.w.agent_current = 100 * M
+        self.clock.t += pressure.CALM_FOR
+        granted = waiting.recv()
+        self.assertEqual((granted["state"], granted["run"]), ("granted", queued["run"]), granted)
+        self.assertEqual(self.admin.call({'op': 'admissions'})['state'], 'running')
+
+    def test_stall_with_plenty_of_memory_is_left_alone(self):
+        conn, _ = self.running('z', 'p3')
+        self.w.agent_current = 100 * M   # one run over its own MemoryHigh stalls itself
+        self.w.stall('agents', 10_000_000, 10_000_000)
+        time.sleep(0.5)
+        self.assertEqual(self.w.stopped, [])
+        self.assertEqual(self.admin.call({'op': 'admissions'})['state'], 'running')
+        self.w.available = 900 * M        # now the desktop reserve is being eaten: the same stall counts
+        self.w.stall('agents', 20_000_000, 20_000_000)
+        self.assertRegex(conn.recv()['reason'], r'^shed: memory full-pressure')
+
+    def test_low_memory_alone_sheds(self):
+        conn, _ = self.running('z', 'p3')
+        self.w.available = 400 * M   # below half of the 1000M reserve
+        self.assertRegex(conn.recv()['reason'], r'^shed: MemAvailable 400 MiB below half the desktop reserve')
+
+    def test_some_pressure_pauses_without_shedding(self):
+        conn, _ = self.running('z', 'p3')
+        self.w.agent_current = 950 * M
+        self.w.stall('system', 10_000_000, 0)
+        self.assertTrue(until(lambda: self.admin.call({'op': 'admissions'})['state'] == 'paused'))
+        self.assertEqual(self.admin.call({'op': 'admissions'})['pressure'], pressure.PAUSED)
+        self.assertEqual(self.w.stopped, [])
+
+    def test_trigger_report_sheds_without_waiting_for_the_sample(self):
+        conn, _ = self.running('z', 'p3')
+        self.w.agent_current = 950 * M
+        self.hub.loop.call_soon_threadsafe(self.hub.pressure_check, {(self.w.pressure['system'], 'full')})
+        self.assertRegex(conn.recv()['reason'], r'^shed: memory full-pressure ≥ 50 ms/2 s \(system, trigger\)')
+
+    def test_pool_wait_and_status(self):
+        conn, first = self.running('a', 'p1', cmd='browser one', pools=['browser'])
+        waiting = self.w.conn()
+        self.addCleanup(waiting.close)
+        second = waiting.call({'op': 'run.request', 'session': 'z', 'cmd': 'browser two', 'cwd': '/tmp',
+                               'estimate': '1M', 'pools': ['browser']})
+        self.assertEqual(second['reason'], f'pool browser 1/1 held by run {first["run"]}')
+        status = self.admin.call({'op': 'status'})
+        self.assertEqual(status['machine']['pools'], {'browser': {'size': 1, 'held_by': [first['run']]}})
+        self.assertEqual(status['queue'][0]['effective_class'], 'p3')
+        why = self.admin.call({'op': 'why', 'run': second['run']})
+        self.assertIn({'rule': 'pool', 'pool': 'browser', 'used': 1, 'size': 1, 'pass': False}, why['checks'])
+        bad = self.admin.call({'op': 'run.request', 'session': 'z', 'cmd': 'x', 'pools': 'browser'})
+        self.assertEqual(bad['error']['code'], 'bad_request')
+        self.w.end_scope('p1', first['run'])
+        self.assertEqual(waiting.recv()['state'], 'granted')
+
+
+class AdmissionsTest(unittest.TestCase):
+    def test_pause_by_hand_holds_the_queue_and_survives_restart(self):
+        w = World()
+        self.addCleanup(w.cleanup)
+        hub, thread = w.start()
+        paused = w.call({'op': 'admissions', 'state': 'paused', 'reason': 'demo'})
+        self.assertEqual((paused['state'], paused['by_hand']), ('paused', 'demo'))
+        self.assertEqual(w.call({'op': 'admissions', 'state': 'frozen'})['error']['code'], 'bad_request')
+        w.call({'op': 'session.start', 'session': 'a', 'pid': 0, 'cwd': '/tmp'})
+        conn = w.conn()
+        self.addCleanup(conn.close)
+        queued = conn.call({'op': 'run.request', 'session': 'a', 'cmd': 'x', 'cwd': '/tmp', 'estimate': '1M'})
+        self.assertEqual(queued['reason'], 'admissions paused by hand (demo)')
+        w.stop(hub, thread)
+        hub2, thread2 = w.start()
+        self.addCleanup(w.stop, hub2, thread2)
+        self.assertEqual(w.call({'op': 'status'})['machine']['admissions']['by_hand'], 'demo')
+        self.assertEqual(w.call({'op': 'admissions', 'state': 'running'})['state'], 'running')
+        self.assertIsNone(w.call({'op': 'admissions'})['by_hand'])
+
+
+class HistoryHubTest(unittest.TestCase):
+    def test_the_peak_of_past_runs_becomes_the_estimate(self):
+        w = World()
+        self.addCleanup(w.cleanup)
+        hub, thread = w.start()
+        self.addCleanup(w.stop, hub, thread)
+        w.call({'op': 'session.start', 'session': 'a', 'pid': 0, 'cwd': '/tmp'})
+        conn = w.conn()
+        self.addCleanup(conn.close)
+        for _ in range(2):
+            grant = conn.call({'op': 'run.request', 'session': 'a', 'cmd': 'npm run build', 'cwd': '/tmp',
+                               'estimate': '1M'})
+            w.scope('p2', grant['run'])
+            conn.send({'op': 'run.started', 'run': grant['run'], 'unit': grant['unit'], 'pid': os.getpid()})
+            self.assertTrue(until(lambda: hub.sched.runs[grant['run']].state == 'running'))
+            w.end_scope('p2', grant['run'])
+            self.assertEqual(conn.call({'op': 'run.ended', 'run': grant['run'], 'exit': 0})['peak'], 20 * M)
+        learned = conn.call({'op': 'run.request', 'session': 'a', 'cmd': 'npm run build --verbose', 'cwd': '/tmp'})
+        why = w.call({'op': 'why', 'run': learned['run']})
+        self.assertEqual((why['estimate'], why['estimate_source']), (20 * M, 'history'))
+        rows = history.History(w.history_path).db.execute('SELECT count(*) FROM runs').fetchone()[0]
+        self.assertEqual(rows, 2)  # one row per run, even though both the scope end and run.ended were seen
+
+
 class InotifyTest(unittest.TestCase):
     def test_scope_end_is_seen_without_the_tick(self):
         w = World()
@@ -327,7 +524,8 @@ class ClientTest(unittest.TestCase):
 
     def args(self, *argv, **kw):
         return argparse.Namespace(argv=list(argv), shell=kw.get('shell'), session=kw.get('session'),
-                                  estimate=kw.get('estimate', '10M'), wait=kw.get('wait'))
+                                  estimate=kw.get('estimate', '10M'), wait=kw.get('wait'), kind=kw.get('kind'),
+                                  pool=kw.get('pool'))
 
     def test_run_through_hub_registers_implicit_session_and_returns_exit_code(self):
         hub, thread = self.w.start()
@@ -354,6 +552,34 @@ class ClientTest(unittest.TestCase):
             hold.send({'op': 'run.request', 'session': 'x', 'cmd': 'hold', 'cwd': '/tmp', 'estimate': '900M'})
             hold.recv()
             self.assertEqual(client.cmd_run(self.args('true', estimate='500M', wait='0.3s')), client.EX_TEMPFAIL)
+
+    def test_admissions_and_status_print(self):
+        self.w.cfg.pools['browser'] = 1
+        hub, thread = self.w.start()
+        self.addCleanup(self.w.stop, hub, thread)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(client.cmd_admissions(argparse.Namespace(action='pause', reason='demo')), 0)
+            hold = self.w.conn()
+            self.addCleanup(hold.close)
+            hold.call({'op': 'session.start', 'session': 'x', 'cwd': '/tmp'})
+            hold.call({'op': 'run.request', 'session': 'x', 'cmd': 'held', 'cwd': '/tmp', 'estimate': '1M'})
+            self.assertEqual(client.cmd_status(argparse.Namespace(json=False)), 0)
+            self.assertEqual(client.cmd_admissions(argparse.Namespace(action='resume', reason='x')), 0)
+            self.assertEqual(client.cmd_admissions(argparse.Namespace(action=None, reason='x')), 0)
+        text = out.getvalue()
+        self.assertIn('admissions paused: admissions paused by hand (demo)', text)
+        self.assertIn('pools    browser 0/1', text)
+        self.assertIn('est 1 MiB (explicit)', text)
+        self.assertTrue(text.rstrip().endswith('admissions running'))
+        with mock.patch('agenthub.client.say') as said:
+            self.assertEqual(client.cmd_run(self.args('true', pool=['gpu'])), 2)
+            self.assertIn("unknown pool 'gpu'", said.call_args[0][0])
+            self.assertEqual(client.cmd_run(self.args('true', kind='nope')), 2)
+            self.assertIn("unknown kind 'nope'", said.call_args[0][0])
+            # any other refusal of the request is the hub's problem, not the command's: it runs anyway
+            self.assertEqual(client.cmd_run(self.args('--', 'sh', '-c', 'exit 7', session='bad id')), 7)
+            self.assertIn('hub answered bad_request', said.call_args[0][0])
 
     def test_nothing_to_run_and_bad_values(self):
         with mock.patch('agenthub.client.say'):

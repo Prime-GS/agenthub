@@ -248,7 +248,8 @@ def cmd_run(args):
     cwd = os.getcwd()
     sid, implicit = session_id(args.session)
     request = {'op': 'run.request', 'session': sid, 'cmd': display, 'cwd': cwd, 'estimate': args.estimate,
-               'wait': args.wait, 'agent_id': os.environ.get('AGENTHUB_AGENT_ID')}
+               'wait': args.wait, 'agent_id': os.environ.get('AGENTHUB_AGENT_ID'), 'kind': args.kind,
+               'pools': args.pool}
     try:
         conn = connect(pfx)
     except OSError as e:
@@ -285,6 +286,9 @@ def cmd_run(args):
         if err['code'] in ('wait_expired', 'cancelled'):
             say(f'{err["code"]}: {err["message"]}')
             return EX_TEMPFAIL
+        if err['code'] in ('unknown_kind', 'unknown_pool'):
+            say(f'{err["message"]}')   # a wrong --kind or --pool is the caller's mistake, not a broken hub
+            return 2
         return run_direct(argv, cwd, f'hub answered {err["code"]}: {err["message"]}', pfx)
     code, stopped = execute(conn, answer, argv, pfx)
     conn.close()
@@ -323,10 +327,17 @@ def short(text, width):
 def print_status(st):
     m = st['machine']
     psi = m.get('pressure', {})
+
+    def avg(source, kind):
+        return f'{psi.get(source, {}).get(kind, {}).get("avg10", 0):.0f}%'
     print(f'machine  {format_size(m["total"])}  available {format_size(m["available"])}  '
           f'reserve {format_size(m["reserve"])}  budget {format_size(m["budget"])}  '
-          f'agents {format_size(m["agent_current"])}  headroom {format_size(m["headroom"])}  '
-          f'psi mem some {psi.get("some", {}).get("avg10", 0):.0f}% full {psi.get("full", {}).get("avg10", 0):.0f}%')
+          f'agents {format_size(m["agent_current"])}  headroom {format_size(m["headroom"])}')
+    print(f'pressure memory some {avg("memory", "some")} full {avg("memory", "full")}  '
+          f'agents some {avg("agents", "some")} full {avg("agents", "full")}  cpu some {avg("cpu", "some")}  '
+          f'admissions {m.get("admissions", {}).get("reason") or "open"}')
+    if m.get('pools'):
+        print('pools    ' + '  '.join(f'{name} {len(p["held_by"])}/{p["size"]}' for name, p in m['pools'].items()))
     now = time.time()
     print(f'{"SESSION":<16} {"AGENT":<12} {"CLASS":<5} {"WHY":<26} CWD')
     for s in st['sessions']:
@@ -340,7 +351,9 @@ def print_status(st):
         print(f'{r["id"]:<5} {short(r["session"], 16):<16} {r["class"]:<5} {r["kind"]:<8} {mem:<20} {cpu:>6} '
               f'{age(elapsed):>7}  {short(r["cmd"], 60)}{flag}')
     for q in st['queue']:
-        print(f'QUEUE #{q["position"]} run {q["id"]}  {q["class"]}  {q["kind"]}  est {format_size(q["estimate"])}  '
+        cls = q['class'] if q.get('effective_class', q['class']) == q['class'] else f'{q["class"]}→{q["effective_class"]}'
+        print(f'QUEUE #{q["position"]} run {q["id"]}  {cls}  {q["kind"]}  '
+              f'est {format_size(q["estimate"])} ({q.get("estimate_source", "?")})  '
               f'waiting {age(now - q["requested"])}: {q["reason"]}  ·  {short(q["cmd"], 50)}')
 
 
@@ -370,6 +383,19 @@ def print_answer(answer):
 
 def cmd_why(args):
     return print_answer(request({'op': 'why', 'run': args.run}))
+
+
+def cmd_admissions(args):
+    msg = {'op': 'admissions'}
+    if args.action:
+        msg.update(state='paused' if args.action == 'pause' else 'running', reason=args.reason)
+    answer = request(msg)
+    if answer is None or not answer.get('ok'):
+        return print_answer(answer)
+    print(f'admissions {answer["state"]}' + (f': {answer["reason"]}' if answer.get('reason') else ''))
+    if answer.get('by_hand') and answer.get('pressure'):
+        print(f'also: {answer["pressure"]} (lifts itself when memory is calm)')
+    return 0
 
 
 def cmd_stop(args):

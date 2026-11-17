@@ -5,9 +5,9 @@ command (build, test suite, headless browser, emulator, dev stand) asks it for r
 priority, and the kernel shares CPU between priorities by weight. Nobody needs a cron job, and a session that
 never heard of the others still cannot sink the machine.
 
-> **Status: milestone M1 (core hub) works.** Sessions, a priority queue with admission by memory, class slices
-> and a fail-open client run on a real systemd user manager. Pressure handling and the Claude Code plugin come
-> next — see [docs/roadmap.md](docs/roadmap.md).
+> **Status: milestones M1 (core hub) and M2 (pressure) work.** Sessions, a priority queue with admission by
+> memory, class slices, a fail-open client, PSI-driven pausing and shedding, learned estimates, pools and aging
+> run on a real systemd user manager. The Claude Code plugin comes next — see [docs/roadmap.md](docs/roadmap.md).
 > На русском — [README.ru.md](README.ru.md).
 
 ## The problem
@@ -88,6 +88,8 @@ agenthub session prio demo p1
 agenthub run --session demo --estimate 2G -- npm run build
 agenthub status                              # machine, sessions, runs, queue with reasons
 agenthub why 3                               # one decision in full
+agenthub run --pool browser -- npx playwright test   # needs [pools] browser = N in the config
+agenthub admissions pause --reason demo      # hold new runs (running ones go on); resume lifts it
 agenthub uninstall
 ```
 

@@ -64,6 +64,7 @@ class ClassSpec:
     name: str
     cpu_weight: int
     memory_low: int | None = None
+    preemptible: bool = True
 
 
 @dataclass
@@ -79,8 +80,9 @@ class ProjectRule:
 @dataclass
 class Kind:
     name: str
-    pattern: re.Pattern
+    pattern: re.Pattern | None
     estimate: int
+    pools: tuple = ()
 
 
 @dataclass
@@ -91,7 +93,10 @@ class Config:
     cpu_weight: int = 80
     default_estimate: int = 1 << 30
     idle_exit: float = 600.0
+    aging_step: float = 300.0
+    system_pressure: bool = True
     classes: dict = field(default_factory=dict)
+    pools: dict = field(default_factory=dict)
     projects: list = field(default_factory=list)
     kinds: list = field(default_factory=list)
     source: str = '(defaults)'
@@ -105,11 +110,19 @@ class Config:
         return DEFAULT_CLASS, 'default'
 
     def kind_for(self, cmd):
-        """(kind, default estimate) for a command line; `other` with the global default when no rule matches."""
+        """The first kind whose rule matches the command line; `other` with the global default when none does."""
         for kind in self.kinds:
             if kind.pattern.search(cmd):
-                return kind.name, kind.estimate
-        return 'other', self.default_estimate
+                return kind
+        return Kind('other', None, self.default_estimate)
+
+    def kind_named(self, name):
+        if name == 'other':
+            return Kind('other', None, self.default_estimate)
+        for kind in self.kinds:
+            if kind.name == name:
+                return kind
+        return None
 
 
 def total_memory():
@@ -146,7 +159,7 @@ def load(path=None, total=None):
 
 
 def expect(value, kind, where, what):
-    if not isinstance(value, kind) or isinstance(value, bool):
+    if not isinstance(value, kind) or (isinstance(value, bool) and kind is not bool):
         raise ConfigError(f'{where}: expected {what}, got {value!r}')
     return value
 
@@ -173,6 +186,9 @@ def build(data, total, source='(defaults)'):
         cpu_weight=weight(machine.get('cpu_weight', 80), f'{where}: machine.cpu_weight'),
         default_estimate=parse_size(machine.get('default_estimate', '1G'), f'{where}: machine.default_estimate', total),
         idle_exit=parse_duration(machine.get('idle_exit', '10m'), f'{where}: machine.idle_exit'),
+        aging_step=parse_duration(machine.get('aging_step', '5m'), f'{where}: machine.aging_step'),
+        system_pressure=expect(machine.get('system_pressure', True), bool, f'{where}: machine.system_pressure',
+                               'true or false'),
         source=source,
     )
     classes = expect(data.get('classes', {}), dict, f'{where}: [classes]', 'a table')
@@ -186,7 +202,13 @@ def build(data, total, source='(defaults)'):
             name=name,
             cpu_weight=weight(spec.get('cpu_weight', DEFAULT_WEIGHTS[name]), f'{where}: classes.{name}.cpu_weight'),
             memory_low=parse_size(low, f'{where}: classes.{name}.memory_low', total) if low is not None else None,
+            preemptible=expect(spec.get('preemptible', name != 'p0'), bool, f'{where}: classes.{name}.preemptible',
+                               'true or false'),
         )
+    for name, size in expect(data.get('pools', {}), dict, f'{where}: [pools]', 'a table').items():
+        if not 1 <= expect(size, int, f'{where}: pools.{name}', 'a whole number of units') <= 1000:
+            raise ConfigError(f'{where}: pools.{name}: a pool has 1..1000 units, got {size}')
+        cfg.pools[name] = size
     for i, rule in enumerate(expect(data.get('projects', []), list, f'{where}: projects', 'a list of [[projects]]')):
         at = f'{where}: projects[{i}]'
         if not isinstance(rule, dict) or 'path' not in rule or 'class' not in rule:
@@ -206,5 +228,9 @@ def build(data, total, source='(defaults)'):
         except re.error as e:
             raise ConfigError(f'{at}: bad regular expression: {e}') from e
         estimate = parse_size(kind.get('estimate', cfg.default_estimate), f'{at}.estimate', total)
-        cfg.kinds.append(Kind(kind['name'], pattern, estimate))
+        pools = expect(kind.get('pools', []), list, f'{at}.pools', 'a list of pool names')
+        for pool in pools:
+            if pool not in cfg.pools:
+                raise ConfigError(f'{at}.pools: unknown pool {pool!r}; declare it under [pools]')
+        cfg.kinds.append(Kind(kind['name'], pattern, estimate, tuple(pools)))
     return cfg

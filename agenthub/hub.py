@@ -10,6 +10,8 @@ import sys
 import time
 
 from . import config as configmod
+from . import history as historymod
+from . import pressure
 from . import system
 from .scheduler import ACTIVE, Machine, Run, Scheduler, SchedulerError, run_from, session_from, to_dict
 
@@ -52,7 +54,8 @@ def session_arg(msg):
 
 
 class Hub:
-    def __init__(self, cfg, pfx, cgroups, state, clock=time.time, stop_unit=system.stop_unit, read_machine=None):
+    def __init__(self, cfg, pfx, cgroups, state, clock=time.time, stop_unit=system.stop_unit, read_machine=None,
+                 history=None, pressure_paths=None, use_triggers=True):
         self.cfg = cfg
         self.pfx = pfx
         self.cg = cgroups
@@ -61,6 +64,19 @@ class Hub:
         self.stop_unit = stop_unit
         self.read_machine = read_machine or self.machine_now
         self.sched = Scheduler(cfg, clock)
+        self.history = history
+        if pressure_paths is None:
+            pressure_paths = {'agents': os.path.join(cgroups.base, 'memory.pressure')}
+            if cfg.system_pressure:
+                pressure_paths['system'] = '/proc/pressure/memory'
+        self.pressure_paths = pressure_paths
+        self.sampler = pressure.Sampler()
+        self.governor = pressure.Governor()
+        self.use_triggers = use_triggers
+        self.triggers = None
+        self.sample_every = pressure.WINDOW_US / 1e6
+        self.sampled_at = None
+        self.last_shed = None   # (run id, governor time) of the last victim
         self.conns = {}
         self.sent = {}
         self.watches = {}
@@ -106,6 +122,11 @@ class Hub:
 
     def restore(self):
         """Rebuilds sessions and running runs from the state directory and cgroupfs after a restart."""
+        try:
+            with open(self.path('admissions.json')) as f:
+                self.sched.paused_by_hand = json.load(f).get('paused_by_hand')
+        except (OSError, ValueError, AttributeError):
+            pass
         try:
             with open(self.path('next-id.json')) as f:
                 self.sched.next_id = max(self.sched.next_id, int(json.load(f)['next_id']))
@@ -211,7 +232,19 @@ class Hub:
             return
         if not os.path.isdir(directory) and self.clock() - (run.started or 0) < SCOPE_GRACE:
             return  # systemd-run has not created the scope yet
-        self.end_run(run, peak=system.memory_peak(directory))
+        self.end_run(run)
+
+    def sample_run(self, run):
+        """Keeps the highest memory.peak and the CPU time seen so far: the scope may be gone when the run ends."""
+        if not run.unit:
+            return
+        directory = self.cg.run_dir(run.cls, run.id)
+        peak = system.memory_peak(directory) or system.memory_current(directory)
+        if peak:
+            run.peak = max(run.peak or 0, peak)
+        cpu = system.cpu_usage_usec(directory)
+        if cpu:
+            run.cpu_usec = max(run.cpu_usec or 0, cpu)
 
     def claim_granted(self, run):
         """A granted run whose client is gone: its scope may still come up (the client died after starting it,
@@ -225,8 +258,12 @@ class Hub:
             self.remove(self.path('runs', f'{run.id}.json'))
             self.schedule()
 
-    def end_run(self, run, exit=None, peak=None):
-        self.sched.finish(run.id, 'ended', exit=exit, peak=peak)
+    def end_run(self, run, exit=None):
+        """The one place a run becomes `ended`, so the history gets exactly one row for it."""
+        self.sample_run(run)
+        self.sched.finish(run.id, 'ended', exit=exit)
+        if self.history is not None:
+            self.history.record(run.fp, run, run.shed)
         self.unwatch_run(run.id)
         self.remove(self.path('runs', f'{run.id}.json'))
         self.schedule()
@@ -349,13 +386,21 @@ class Hub:
         return {'ok': True, 'class': session.cls, 'source': session.source}
 
     def op_run_request(self, msg, writer, mine):
-        estimate = msg.get('estimate')
-        wait = msg.get('wait')
+        sid, cmd = session_arg(msg), str(msg['cmd'])
+        estimate, wait, kind, pools = msg.get('estimate'), msg.get('wait'), msg.get('kind'), msg.get('pools')
+        if kind is not None and not isinstance(kind, str):
+            raise SchedulerError('bad_request', 'kind must be a kind name')
+        if pools is not None and not (isinstance(pools, list) and all(isinstance(p, str) for p in pools)):
+            raise SchedulerError('bad_request', 'pools must be a list of pool names')
+        cwd = msg.get('cwd') or self.sched.session(sid).cwd
+        fp = historymod.fingerprint(cmd, cwd)
+        learned = self.history.estimate(fp) if self.history is not None and estimate is None else None
         run = self.sched.request(
-            session_arg(msg), str(msg['cmd']), msg.get('cwd'),
+            sid, cmd, cwd,
             estimate=configmod.parse_size(estimate, 'estimate') if estimate is not None else None,
             agent_id=msg.get('agent_id'),
-            wait=configmod.parse_duration(wait, 'wait') if wait is not None else None)
+            wait=configmod.parse_duration(wait, 'wait') if wait is not None else None,
+            kind=kind, pools=pools, learned=learned, fp=fp)
         if run.state == 'refused':
             return error('refused', run.reason, run=run.id)
         mine.add(run.id)
@@ -378,11 +423,10 @@ class Hub:
 
     def op_run_ended(self, msg, writer, mine):
         run = self.sched.run(int(msg['run']))
-        directory = self.cg.run_dir(run.cls, run.id)
         self.conns.pop(run.id, None)
         mine.discard(run.id)
         if run.state not in ('ended', 'cancelled'):
-            self.end_run(run, exit=msg.get('exit'), peak=system.memory_peak(directory))
+            self.end_run(run, exit=msg.get('exit'))
         else:
             self.sched.finish(run.id, exit=msg.get('exit'))
         duration = (run.ended or self.clock()) - (run.started or run.granted or run.requested)
@@ -399,6 +443,11 @@ class Hub:
             return {'ok': True, 'run': run.id, 'state': 'cancelled'}
         if run.state not in ACTIVE:
             return error('bad_request', f'run {run.id} is {run.state}')
+        self.stop_run(run, why)
+        return {'ok': True, 'run': run.id, 'state': 'stopping'}
+
+    def stop_run(self, run, why):
+        """Tells the run's client why and stops its scope; used by `run.stop` and by shedding."""
         run.stopping = why
         self.save_run(run)
         writer_of_run = self.conns.get(run.id)
@@ -406,7 +455,96 @@ class Hub:
             send(writer_of_run, {'ok': True, 'state': 'stopping', 'run': run.id, 'reason': why})
         if run.unit or run.state == 'granted':
             self.stop(run)
-        return {'ok': True, 'run': run.id, 'state': 'stopping'}
+
+    def op_admissions(self, msg, writer, mine):
+        """`paused` sets a pause by hand, `running` lifts it; a pressure pause lifts itself when it is calm."""
+        state = msg.get('state')
+        if state not in (None, 'paused', 'running'):
+            raise SchedulerError('bad_request', f'state must be "paused" or "running", got {state!r}')
+        if state is not None:
+            self.sched.paused_by_hand = (str(msg.get('reason') or 'no reason given')) if state == 'paused' else None
+            self.write_json(self.path('admissions.json'), {'paused_by_hand': self.sched.paused_by_hand})
+            self.schedule()
+        return dict(self.admissions(), ok=True)
+
+    def admissions(self):
+        return {'state': 'paused' if self.sched.paused else 'running', 'reason': self.sched.paused,
+                'by_hand': self.sched.paused_by_hand, 'pressure': self.governor.paused}
+
+    # pressure
+
+    def arm_triggers(self):
+        if self.triggers is None:
+            return
+        for path in self.pressure_paths.values():
+            if not self.triggers.armed(path):
+                self.triggers.arm(path)
+
+    def triggers_fired(self):
+        fired = self.triggers.fired()
+        if fired:
+            self.pressure_check(fired)
+
+    def pressure_check(self, fired=frozenset()):
+        """Pause on `some`, shed one run on `full` or when MemAvailable falls below half the reserve, resume when calm.
+        Triggers report at once; the files are also sampled every 2 s, which is all there is without triggers."""
+        some = full = None
+        for name, path in self.pressure_paths.items():
+            if (path, 'full') in fired:
+                full = full or f'memory full-pressure ≥ {pressure.FULL_US // 1000} ms/2 s ({name}, trigger)'
+            if (path, 'some') in fired:
+                some = some or f'memory some-pressure ≥ {pressure.SOME_US // 1000} ms/2 s ({name}, trigger)'
+        now = time.monotonic()
+        if not fired and (self.sampled_at is None or now - self.sampled_at >= self.sample_every * 0.9):
+            self.sampled_at = now
+            for name, path in self.pressure_paths.items():
+                rates = self.sampler.rates(path)
+                if rates and rates['full'] >= pressure.FULL_US:
+                    full = full or f'memory full-pressure {rates["full"] / 1000:.0f} ms/2 s ({name})'
+                if rates and rates['some'] >= pressure.SOME_US:
+                    some = some or f'memory some-pressure {rates["some"] / 1000:.0f} ms/2 s ({name})'
+        machine = self.read_machine()
+        short = (machine.agent_current >= self.cfg.agent_budget * pressure.NEAR_BUDGET
+                 or machine.mem_available < self.cfg.desktop_reserve)
+        if not short:
+            # memory is plentiful: the stall is a run over its own MemoryHigh, which slows only that run;
+            # stopping others would not help it
+            some = full = None
+        if self.cfg.desktop_reserve and machine.mem_available < self.cfg.desktop_reserve / 2:
+            full = full or (f'MemAvailable {configmod.format_size(machine.mem_available)} below half the desktop '
+                            f'reserve')
+        if full and self.victim_alive():
+            some, full = some or full, None   # the last victim still holds its memory: pause, but shed no other
+        shed = self.governor.assess(some, full, self.sched.room(machine)[2])
+        self.sched.pressure = self.governor.paused
+        if shed:
+            self.shed(shed)
+        self.schedule()
+
+    def victim_alive(self):
+        if self.last_shed is None:
+            return False
+        rid, at = self.last_shed
+        run = self.sched.runs.get(rid)
+        return run is not None and run.state in ACTIVE and self.governor.clock() - at < pressure.STOP_WAIT
+
+    def can_shed(self, run):
+        """A run without a scope can only be stopped by its client; an emptied scope has already ended."""
+        if run.unit:
+            return system.populated(self.cg.run_dir(run.cls, run.id))
+        return run.id in self.conns
+
+    def shed(self, why):
+        run = self.sched.victim(self.can_shed)
+        if run is None:
+            log.warning('pressure: %s, but no run can be stopped', why)
+            return
+        self.sample_run(run)
+        run.shed = True
+        self.last_shed = (run.id, self.governor.clock())
+        # the fingerprint, not the command line: arguments may carry secrets, and the journal is on disk
+        log.warning('shedding run %s (%s, %s): %s', run.id, run.cls, run.fp or run.kind, why)
+        self.stop_run(run, f'shed: {why}; lowest class, newest run')
 
     def stop(self, run):
         # systemctl must not hold the event loop
@@ -416,16 +554,23 @@ class Hub:
         m = self.read_machine()
         free, growth, headroom = self.sched.room(m)
         runs = sorted(self.sched.runs.values(), key=lambda r: r.id)
+        held = self.sched.pool_use()
         return {'ok': True,
                 'machine': {'total': self.cfg.total_ram, 'available': m.mem_available, 'reserve': self.cfg.desktop_reserve,
                             'budget': self.cfg.agent_budget, 'agent_current': m.agent_current, 'free': free,
-                            'growth': growth, 'headroom': headroom, 'pressure': system.pressure('memory'),
-                            'config': self.cfg.source},
+                            'growth': growth, 'headroom': headroom, 'config': self.cfg.source,
+                            'pressure': {'memory': system.pressure('/proc/pressure/memory'),
+                                         'agents': system.pressure(os.path.join(self.cg.base, 'memory.pressure')),
+                                         'cpu': system.pressure('/proc/pressure/cpu')},
+                            'admissions': self.admissions(),
+                            'pools': {name: {'size': size, 'held_by': held.get(name, [])}
+                                      for name, size in self.cfg.pools.items()}},
                 'sessions': [record(s) for s in self.sched.sessions.values()],
                 'runs': [dict(record(r), current=m.run_current.get(r.id),
                               cpu_usec=system.cpu_usage_usec(self.cg.run_dir(r.cls, r.id)))
                          for r in runs if r.state in ACTIVE],
-                'queue': [dict(record(r), position=i) for i, r in enumerate(self.sched.queue(), 1)],
+                'queue': [dict(record(r), position=i, effective_class=self.sched.effective_class(r))
+                          for i, r in enumerate(self.sched.queue(), 1)],
                 'recent': [record(r) for r in runs if r.state not in ACTIVE and r.state != 'queued'][-10:]}
 
     def op_why(self, msg, writer, mine):
@@ -449,9 +594,12 @@ class Hub:
                 self.reply_final(run, error('wait_expired', f'run {run.id}: {run.reason}', run=run.id))
             for run in list(self.sched.active()):
                 if run.state == 'running':
+                    self.sample_run(run)
                     self.watch_run(run)
                 elif run.id not in self.conns:
                     self.claim_granted(run)
+            self.arm_triggers()   # the agent slice's cgroup exists only while something runs in it
+            self.pressure_check()
             self.schedule()
             self.sched.forget()
             system.notify('WATCHDOG=1')
@@ -469,7 +617,20 @@ class Hub:
         except OSError as e:
             log.warning('inotify unavailable (%s); run ends are found every %.0fs', e, TICK)
             self.inotify = None
+        try:
+            if self.use_triggers:
+                self.triggers = pressure.Triggers()
+                loop.add_reader(self.triggers.fileno(), self.triggers_fired)
+        except OSError as e:
+            log.warning('PSI triggers unavailable (%s); pressure is sampled every 2 s', e)
+            self.triggers = None
         self.restore()
+        for path in self.pressure_paths.values():
+            self.sampler.rates(path)   # the baseline: the first tick already sees a rate
+        self.sampled_at = time.monotonic()
+        self.arm_triggers()
+        armed = [n for n, p in self.pressure_paths.items() if self.triggers is not None and self.triggers.armed(p)]
+        log.info('pressure: triggers on %s; files sampled every 2 s', ', '.join(armed) or 'nothing yet')
         self.server = await asyncio.start_unix_server(self.handle, sock=sock)
         ticker = asyncio.create_task(self.tick())
         system.notify('READY=1')
@@ -483,6 +644,11 @@ class Hub:
             if self.inotify is not None:
                 loop.remove_reader(self.inotify.fd)
                 self.inotify.close()
+            if self.triggers is not None:
+                loop.remove_reader(self.triggers.fileno())
+                self.triggers.close()
+            if self.history is not None:
+                self.history.close()
             system.notify('STOPPING=1')
 
 
@@ -517,6 +683,7 @@ def main():
         print(f'agenthub hub: config error: {e}', file=sys.stderr)
         return 78
     sock = system.activated_socket() or listening_socket(system.socket_path(pfx))
-    hub = Hub(cfg, pfx, system.Cgroups(pfx), system.state_dir(pfx))
+    hub = Hub(cfg, pfx, system.Cgroups(pfx), system.state_dir(pfx),
+              history=historymod.History(historymod.default_path(pfx)))
     asyncio.run(hub.serve(sock))
     return 0
