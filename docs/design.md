@@ -29,7 +29,7 @@ Non-goals:
 | Component | Role |
 |---|---|
 | `agenthubd` | The hub (`agenthub hub`): one process per user, systemd user service, socket-activated. Holds sessions, runs, the queue; decides admission and shedding. |
-| `agenthub` | The client CLI: `run`, `status`, `why`, `stop`, `admissions`, `session start\|end\|prio`, `hook`, `wrap`, `mcp`, `install`, `uninstall`. Runs commands in the caller's context. |
+| `agenthub` | The client CLI: `run`, `status`, `why`, `stop`, `admissions`, `session start\|end\|prio`, `hook`, `wrap`, `mcp`, `install`, `uninstall`, `root-extras`. Runs commands in the caller's context. |
 | systemd units | `agenthub.socket`, `agenthub.service`, `agenthub.slice` and four class slices. |
 | Integrations | Claude Code plugin in `claude-code/` (hooks; `agenthub status --line` for the status line); `agenthub wrap` (shims in `PATH`) and `agenthub mcp` (an MCP server) for other agents — [other-agents.md](other-agents.md). |
 
@@ -37,12 +37,13 @@ Non-goals:
 
 ```
 user@UID.service
-├── app.slice, session.slice          desktop, browser, IDE — untouched
+├── app.slice, session.slice          desktop, browser, IDE; a drop-in adds MemoryLow=<desktop reserve>
 └── agenthub.slice                    CPUWeight=80  MemoryHigh=<agent budget>  MemoryMax=<budget + margin>
     ├── agenthub-p0.slice             CPUWeight=1000  MemoryLow=<protected>   urgent, not preemptible
     ├── agenthub-p1.slice             CPUWeight=400                            high
     ├── agenthub-p2.slice             CPUWeight=100                            normal (default)
     └── agenthub-p3.slice             CPUWeight=25                             background
+    (every agent slice also has IOWeight= equal to its CPUWeight=)
         └── agenthub-run-<id>.scope   one per admitted run, MemoryHigh=<estimate × 1.5, at least 256 MiB>
 ```
 
@@ -50,14 +51,47 @@ Weights are hierarchical: the class weights only divide what `agenthub.slice` ge
 competes with the desktop slices at its own weight. Keeping it below the default 100 means the desktop wins
 under contention and agent work gets the whole CPU when the desktop is idle.
 
-`IOWeight` needs the io controller delegated to the user manager, which takes one root drop-in. It is
-optional; without it only CPU and memory are regulated.
+Disk time is shared the same way: each agent slice gets `IOWeight=` equal to its `CPUWeight=`. And
+`agenthub install` gives `app.slice` and `session.slice` a drop-in `50-agenthub.conf` with `MemoryLow=` of the
+desktop reserve each (none when the reserve is 0). The desktop reserve is the free memory admission keeps for the
+desktop (§5); the same size is what the kernel then keeps its reclaim away from on the desktop. The two slices
+claim it together: under one parent's protection they share it in proportion to their use, and the agent slices
+get only what the desktop leaves unclaimed (the cgroup mount has `memory_recursiveprot`), so the protection of
+`p0` never comes out of the desktop's share.
+
+Both need one step by root (§2.3); without it they are written but change nothing, and CPU weights plus
+admission by memory work as before.
 
 ### 2.2 Why systemd units and not raw cgroupfs
 
 The user manager owns the delegated cgroup tree. Creating runs as transient scopes
 (`systemd-run --user --scope --slice=… --unit=agenthub-run-<id>`) keeps systemd's view consistent, gives every
 run a unit name the hub can stop over D-Bus, and makes the state discoverable after a hub restart.
+
+### 2.3 Root extras
+
+Two kernel settings above the user manager decide whether the disk weights and the desktop protection count.
+agenthub never runs anything as root: `agenthub root-extras` prints a shell script for the machine's owner to
+read and run (`agenthub root-extras > agenthub-root.sh`, then `sudo sh agenthub-root.sh`); `--undo` prints the
+script that takes it back. `agenthub root-extras` itself runs as the user (the script is for that user's manager,
+home disk and reserve). The script stops unless it runs as root, writes only the files below, and ends with
+`systemctl daemon-reload`.
+
+| Part | Why it is needed | What the script does |
+|---|---|---|
+| io controller for the user manager | `user@.service` delegates `cpu memory pids` by default, so `IOWeight=` of user slices is ignored | drop-in `user@.service.d/50-agenthub-io.conf` with `Delegate=io` (lists add up); for every user, once their manager starts again — after they log out of every session (and have no lingering), or a reboot |
+| a disk that honours weights | weights count under the BFQ scheduler or the kernel's iocost controller; NVMe disks usually run no scheduler | when the disk of the home directory (the whole disk, not the partition) has neither: `MAJ:MIN enable=1` into `/sys/fs/cgroup/io.cost.qos` now and, if the kernel took it, a `w` line in `/etc/tmpfiles.d/agenthub-iocost.conf` for every boot; nothing when the owner switched iocost on already, and a note when the kernel has no iocost (then BFQ is the way) |
+| protection above the desktop | a cgroup keeps `memory.low` only as far as its parents have it, and `user.slice`, `user-UID.slice`, `user@UID.service` have none | drop-ins `50-agenthub-memory.conf` with `MemoryLow=<desktop reserve>` for those three units |
+
+`--undo` removes these files (and their directories when empty) and switches iocost off again only when its own
+tmpfiles file is there; a refused write there leaves iocost on until reboot and stops nothing else.
+`agenthub install` says for each part whether it is on, pending, off or unknown, and why. It says "on" only from
+what the kernel shows in use: io in the user manager's `cgroup.subtree_control`, and `memory.low` of at least the
+reserve on every cgroup from `user.slice` down to `app.slice` and `session.slice`. Delegated but not yet in use is
+"pending". Unknown: the home directory lies behind LVM, LUKS, RAID or btrfs, where the disk cannot be told (the
+script then names the step to take by hand), or the user manager's cgroup is not the usual
+`user.slice/user-UID.slice/user@UID.service` (then `root-extras` prints no script). `agenthub uninstall` leaves
+the root files alone and says so when they are there.
 
 ## 3. Sessions
 
@@ -278,11 +312,15 @@ when the room it needed appears, through a news file its integration reads ([cla
 | PSI triggers unavailable (kernel < 6.5, or the file refuses them) | the 2-second sampling of the pressure files, which runs anyway, is the only source |
 | History file broken or locked | estimates come from the kind and the default; the hub logs a warning |
 | Config error | hub exits with 78 and names the file, line and key; systemd does not restart it; clients fail open |
+| Root extras missing (no io controller, no BFQ or iocost, no protection above the desktop) | the slices load with their `IOWeight=` and `MemoryLow=`, which change nothing; CPU weights and admission work; `agenthub install` says which part is missing |
 
 ## 9. Security
 
 - Single user, no root, no network. The socket is mode 0600 in `$XDG_RUNTIME_DIR`, and the hub checks
   `SO_PEERCRED` so only the same uid can talk to it.
+- agenthub never runs anything as root. `agenthub root-extras` only prints a script (§2.3); the owner reads and
+  runs it. Two of its settings reach beyond this user: the io drop-in applies to every user's manager, and the
+  `MemoryLow=` of `user.slice` protects all users' sessions together.
 - The hub never executes commands. It only grants, observes, and stops units named `agenthub-run-*` that a
   client of the same user registered.
 - `agenthub mcp` executes the commands an agent passes to its `run` tool, as the user, outside the agent's own
@@ -311,7 +349,7 @@ system_pressure = true      # also react to /proc/pressure/memory, not only to t
 p0 = { cpu_weight = 1000, memory_low = "2G", preemptible = false }
 p1 = { cpu_weight = 400 }
 p2 = { cpu_weight = 100 }
-p3 = { cpu_weight = 25 }
+p3 = { cpu_weight = 25 }     # cpu_weight also sets the slice's IOWeight
 
 [[projects]]
 path = "~/work/**"
@@ -340,8 +378,9 @@ pools = ["browser"]
 
 Sizes take `K/M/G/T` (binary) or a percentage of RAM; durations take `ms/s/m/h`. A pool has 1 to 1000 units, and a
 kind may name only pools declared under `[pools]`. `$AGENTHUB_CONFIG` points to another file; `$AGENTHUB_PREFIX`
-renames the units, the socket and the state directory (the tests use `agenthubtest`). The slice limits are written
-into the unit files at `agenthub install`, so a changed budget needs `agenthub install` again.
+renames the units, the socket and the state directory (the tests use `agenthubtest`). The slice limits and the
+desktop drop-ins are written into the unit files at `agenthub install`, so a changed budget or reserve needs
+`agenthub install` again; the root script takes the reserve when it is printed.
 
 ## 11. Language and size
 
@@ -360,7 +399,10 @@ files), and `tests/test_integration.py` (the real user manager, only with `AGENT
 with swap turned off for the test slice, which must shed exactly the newest `p3` run while a probe standing in
 for the desktop keeps its 50 ms rhythm). `tests/test_claude.py`, `tests/test_wrap.py` and `tests/test_mcp.py`
 run the integrations as their agents meet them — hook JSON, shims and wrapped processes, MCP over pipes —
-against such a hub; the integration tests add two wrapped agents sharing the queue. The plan for all milestones:
+against such a hub; the integration tests add two wrapped agents sharing the queue. `tests/test_extras.py` reads
+a fake `/sys` and cgroup tree and runs the root script for real, with `id` and `systemctl` stubbed and `/etc`
+moved into a temporary directory; the integration tests check that the slices load with their disk weights. Whether
+the extras protect the desktop under load is not tested: it takes root. The plan for all milestones:
 
 - **Scheduler core as pure functions:** admission, ordering, aging, backfill and victim choice are tested with a
   fake clock and fake memory readings.

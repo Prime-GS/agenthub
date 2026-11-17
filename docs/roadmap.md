@@ -7,7 +7,7 @@
 | **M2 — pressure** (done) | PSI triggers, shedding, learned estimates (SQLite history), pools, aging | A synthetic memory storm sheds exactly one lowest-class run and the desktop stays responsive |
 | **M3 — Claude Code plugin** (done) | SessionStart/PreToolUse/SessionEnd/PostToolUse hooks, waiting in the hook, status line | Several real sessions run builds and tests through the hub without any instruction in `CLAUDE.md` |
 | **M4 — other agents** (done) | MCP server for agents without hooks, wrapper for Codex CLI and plain terminals | A non-Claude agent shares the same queue |
-| **M5 — optional root extras** | io controller delegation for `IOWeight`, desktop memory protection | Disk-heavy runs stop starving the desktop |
+| **M5 — optional root extras** (built; the effect needs the owner's root step) | io controller delegation for `IOWeight`, desktop memory protection: `agenthub root-extras` prints the script, `agenthub install` reports what is in place | Disk-heavy runs stop starving the desktop |
 
 ## Open questions
 

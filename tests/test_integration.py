@@ -72,6 +72,7 @@ class Integration(unittest.TestCase):
         cls.env.pop('AGENTHUB_SESSION', None)
         out = cls.cli('install', '--runtime')
         assert out.returncode == 0, out.stderr
+        cls.installed = out.stdout
         cls.start_sessions()
 
     @classmethod
@@ -123,6 +124,19 @@ class Integration(unittest.TestCase):
     def running(self, session, cmd_part):
         return next((r for r in self.status()['runs']
                      if r['session'] == session and cmd_part in r['cmd'] and r['state'] == 'running'), None)
+
+    def test_11_disk_weights_and_root_extras(self):
+        # the slices load with disk weights although the user manager may have no io controller yet
+        for unit, weight in ((f'{PFX}.slice', '80'), (f'{PFX}-p0.slice', '1000'), (f'{PFX}-p2.slice', '100')):
+            self.assertEqual(systemctl('show', unit, '-p', 'IOWeight', '--value').stdout.strip(), weight)
+        self.assertIn('root extras: disk weights ', self.installed)
+        self.assertIn('desktop memory protection off (desktop_reserve is 0)', self.installed)
+        self.assertFalse(os.path.exists(os.path.join(RUNTIME, 'systemd', 'user', 'app.slice.d', f'50-{PFX}.conf')))
+        for args in (('root-extras',), ('root-extras', '--undo')):
+            out = self.cli(*args)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertEqual(subprocess.run(['sh', '-n'], input=out.stdout, text=True).returncode, 0)
+        self.assertIn('Delegate=io', self.cli('root-extras').stdout)
 
     def test_10_wrapped_agents_share_the_queue(self):
         with open(os.path.join(self.tmp, 'hog.py'), 'w') as f:

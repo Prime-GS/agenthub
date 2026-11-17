@@ -6,10 +6,10 @@ import shutil
 import sys
 
 from . import config as configmod
+from . import extras
 from . import history
 from . import system
 from .config import CLASSES
-
 
 
 def unit_dir(runtime):
@@ -35,13 +35,14 @@ def units(pfx, cfg, python=sys.executable, root=system.ROOT):
         system.root_slice(pfx): (
             '[Unit]\nDescription=agenthub: agent work\n\n'
             f'[Slice]\nCPUWeight={cfg.cpu_weight}\nMemoryHigh={cfg.agent_budget}\n'
-            f'MemoryMax={memory_max(cfg)}\n'),
+            f'MemoryMax={memory_max(cfg)}\nIOWeight={cfg.cpu_weight}\n'),
     }
     for cls in CLASSES:
         spec = cfg.classes[cls]
         low = f'MemoryLow={spec.memory_low}\n' if spec.memory_low else ''
         out[system.class_slice(pfx, cls)] = (
-            f'[Unit]\nDescription=agenthub: class {cls}\n\n[Slice]\nCPUWeight={spec.cpu_weight}\n{low}')
+            f'[Unit]\nDescription=agenthub: class {cls}\n\n[Slice]\nCPUWeight={spec.cpu_weight}\n{low}'
+            f'IOWeight={spec.cpu_weight}\n')
     env = f'Environment={unit_quote("PYTHONPATH=" + root)} AGENTHUB_PREFIX={pfx}\n'
     if os.environ.get('AGENTHUB_CONFIG'):
         env += f'Environment={unit_quote("AGENTHUB_CONFIG=" + os.environ["AGENTHUB_CONFIG"])}\n'
@@ -56,6 +57,25 @@ def units(pfx, cfg, python=sys.executable, root=system.ROOT):
     return out
 
 
+def desktop_dropins(pfx, cfg):
+    """{path under the unit directory: content}: memory protection for the desktop slices, the desktop reserve
+    each (they share what their parents protect). It counts only once root gave the parents protection too
+    (`agenthub root-extras`); until then it changes nothing."""
+    if not cfg.desktop_reserve:
+        return {}
+    return {os.path.join(f'{s}.d', f'50-{pfx}.conf'): f'[Slice]\nMemoryLow={cfg.desktop_reserve}\n'
+            for s in extras.DESKTOP}
+
+
+def remove_dropins(directory, pfx):
+    for s in extras.DESKTOP:
+        try:
+            os.unlink(os.path.join(directory, f'{s}.d', f'50-{pfx}.conf'))
+            os.rmdir(os.path.join(directory, f'{s}.d'))
+        except OSError:   # not there, or the directory holds other drop-ins
+            pass
+
+
 def wrapper_path():
     return os.path.expanduser('~/.local/bin/agenthub')
 
@@ -66,6 +86,11 @@ def install(runtime=False):
     directory = unit_dir(runtime)
     os.makedirs(directory, exist_ok=True)
     for name, text in units(pfx, cfg).items():
+        with open(os.path.join(directory, name), 'w') as f:
+            f.write(text)
+    remove_dropins(directory, pfx)   # a reserve of 0 now: nothing stays from an earlier install
+    for name, text in desktop_dropins(pfx, cfg).items():
+        os.makedirs(os.path.dirname(os.path.join(directory, name)), exist_ok=True)
         with open(os.path.join(directory, name), 'w') as f:
             f.write(text)
     if not runtime:
@@ -80,6 +105,8 @@ def install(runtime=False):
     print(f'installed {len(units(pfx, cfg))} units in {directory}; socket {system.socket_path(pfx)}')
     print(f'agent budget {configmod.format_size(cfg.agent_budget)}, desktop reserve '
           f'{configmod.format_size(cfg.desktop_reserve)} (config: {cfg.source})')
+    for line in extras.report(cfg):
+        print(line)
     return 0
 
 
@@ -97,6 +124,7 @@ def uninstall(runtime=False):
             removed += 1
         except FileNotFoundError:
             pass
+    remove_dropins(directory, pfx)
     if not runtime and os.path.exists(wrapper_path()):
         os.unlink(wrapper_path())
     shutil.rmtree(system.state_dir(pfx), ignore_errors=True)
@@ -119,4 +147,6 @@ def uninstall(runtime=False):
         print(f'removed {removed} units from {directory}')
     if os.path.exists(history.default_path(pfx)):
         print(f'kept the learned estimates in {history.default_path(pfx)}; delete the file to forget them')
+    if not runtime and extras.installed():
+        print('the root extras stay in /etc; `agenthub root-extras --undo` prints the script that removes them')
     return 0

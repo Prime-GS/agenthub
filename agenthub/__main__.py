@@ -66,6 +66,9 @@ def parser():
     for name in ('install', 'uninstall'):
         i = sub.add_parser(name, help=f'{name} the systemd user units')
         i.add_argument('--runtime', action='store_true', help='units in $XDG_RUNTIME_DIR (gone after reboot; tests)')
+    extras = sub.add_parser('root-extras', help='print a script for root that lets disk weights and the desktop '
+                                                'memory protection count (agenthub never runs it)')
+    extras.add_argument('--undo', action='store_true', help='print the script that removes them')
     return p
 
 
@@ -86,6 +89,9 @@ def main(argv=None):
     if args.command == 'mcp':
         from . import mcp
         return mcp.main()
+    if args.command == 'root-extras':
+        from . import extras
+        return extras.cmd_root_extras(args)
     if args.command in ('install', 'uninstall'):
         from . import install
         return getattr(install, args.command)(runtime=args.runtime)

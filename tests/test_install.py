@@ -13,7 +13,7 @@ class UnitsTest(unittest.TestCase):
         self.assertEqual(sorted(out), ['agenthubtest-p0.slice', 'agenthubtest-p1.slice', 'agenthubtest-p2.slice',
                                        'agenthubtest-p3.slice', 'agenthubtest.service', 'agenthubtest.slice',
                                        'agenthubtest.socket'])
-        self.assertIn(f'MemoryHigh={6 * GIB}\nMemoryMax={int(6 * GIB * 1.1)}\n', out['agenthubtest.slice'])
+        self.assertIn(f'MemoryHigh={6 * GIB}\nMemoryMax={int(6 * GIB * 1.1)}\nIOWeight=80\n', out['agenthubtest.slice'])
         # budget × 1.1 would pass the RAM: capped 512 MiB under it
         capped = units('agenthubtest', c.build({'machine': {'desktop_reserve': '600M'}}, 8 * GIB))
         self.assertIn(f'MemoryMax={8 * GIB - (512 << 20)}\n', capped['agenthubtest.slice'])
@@ -21,8 +21,8 @@ class UnitsTest(unittest.TestCase):
         tiny = units('agenthubtest', c.build({'machine': {'desktop_reserve': '256M'}}, 8 * GIB))
         budget = 8 * GIB - (256 << 20)
         self.assertIn(f'MemoryHigh={budget}\nMemoryMax={budget}\n', tiny['agenthubtest.slice'])
-        self.assertIn('CPUWeight=1000\nMemoryLow=2147483648', out['agenthubtest-p0.slice'])
-        self.assertIn('CPUWeight=25\n', out['agenthubtest-p3.slice'])
+        self.assertIn('CPUWeight=1000\nMemoryLow=2147483648\nIOWeight=1000\n', out['agenthubtest-p0.slice'])
+        self.assertIn('CPUWeight=25\nIOWeight=25\n', out['agenthubtest-p3.slice'])   # disk weights follow CPU ones
         self.assertIn('ListenStream=%t/agenthubtest.sock\nSocketMode=0600', out['agenthubtest.socket'])
         self.assertIn('RestartPreventExitStatus=78', out['agenthubtest.service'])
 

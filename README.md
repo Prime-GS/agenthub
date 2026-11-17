@@ -5,11 +5,12 @@ command (build, test suite, headless browser, emulator, dev stand) asks it for r
 priority, and the kernel shares CPU between priorities by weight. Nobody needs a cron job, and a session that
 never heard of the others still cannot sink the machine.
 
-> **Status: milestones M1–M4 work.** Sessions, a priority queue with admission by memory, class slices, a
+> **Status: milestones M1–M4 work; M5 is built.** Sessions, a priority queue with admission by memory, class slices, a
 > fail-open client, PSI-driven pausing and shedding, learned estimates, pools, aging, a Claude Code plugin that
 > routes builds and tests through the hub, and `agenthub wrap` / `agenthub mcp` for Codex CLI, terminals and MCP
-> clients run on a real systemd user manager. Optional root extras come next — see
-> [docs/roadmap.md](docs/roadmap.md).
+> clients run on a real systemd user manager. M5: `agenthub root-extras` prints an optional script for root that
+> lets disk weights and the desktop's memory protection count; its effect is not yet checked under load, since that
+> takes the root step — see [docs/roadmap.md](docs/roadmap.md).
 > На русском — [README.ru.md](README.ru.md).
 
 ## The problem
@@ -56,7 +57,8 @@ admission and a live picture of the machine on Linux.
 ## Principles
 
 - Kernel mechanisms first (cgroup v2 weights, memory protection, PSI); user space only decides admission.
-- No root. Runs under the user's systemd manager; an optional root step only adds disk I/O weights.
+- No root. Runs under the user's systemd manager; an optional root step, printed by `agenthub root-extras` and
+  run by the owner, makes disk I/O weights and the desktop's memory protection count.
 - Event-driven: socket activation, PSI triggers, pidfds. No cron, no sleep loops in clients.
 - Agent-neutral core; Claude Code has a plugin (hooks + status line), others go through `agenthub wrap` or MCP.
 - Small and boring: Python 3.11+ standard library only.
@@ -75,7 +77,8 @@ admission and a live picture of the machine on Linux.
 ## Requirements
 
 Linux with cgroup v2 and a systemd user manager (cpu and memory delegated — the default on current distros),
-kernel 6.5+ for unprivileged PSI triggers (older kernels fall back to 2-second sampling), Python 3.11+.
+kernel 6.5+ for unprivileged PSI triggers (older kernels fall back to 2-second sampling), Python 3.11+. Disk
+weights also need the io controller and a disk under BFQ or iocost — the optional root step.
 
 ## License
 
@@ -93,6 +96,7 @@ agenthub status                              # machine, sessions, runs, queue wi
 agenthub why 3                               # one decision in full
 agenthub run --pool browser -- npx playwright test   # needs [pools] browser = N in the config
 agenthub admissions pause --reason demo      # hold new runs (running ones go on); resume lifts it
+agenthub root-extras > agenthub-root.sh      # optional: read it, then sudo sh agenthub-root.sh
 agenthub uninstall
 ```
 
