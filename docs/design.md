@@ -145,8 +145,8 @@ rule matches. Examples of kinds: `build` (`tsc`, `npm run build`, `cargo build`,
 A config without a `kinds` key gets three built-in kinds, tried in this order: `browser` (Playwright, Puppeteer,
 `cypress run`; 1.5 GiB), `test` (`jest`, `vitest`, `pytest`, `mocha`, `rspec`, `phpunit`, `go test`, `cargo test`,
 `python -m pytest|unittest`, `npm|pnpm|yarn|bun [run] test`, `gradle|mvn test`; 1.5 GiB) and `build` (`tsc`,
-`webpack`, `rollup`, `vite build`, `next build`, `cargo build`, `go build`, Gradle, Maven, `make`, `cmake --build`,
-`ninja`, `npm|pnpm|yarn|bun [run] build`; 2 GiB). Without them every command would be light and the Claude Code
+`webpack`, `rollup`, `vite build`, `next build`, `nest build`, `cargo build`, `go build`, Gradle, Maven, `make`,
+`cmake --build`, `ninja`, `npm|pnpm|yarn|bun [run] build`; 2 GiB). Without them every command would be light and the Claude Code
 plugin would route nothing. The tool has to stand where a command starts — at the line start or after `;`, `&&`,
 `||`, `|`, `(`, past `VAR=value` assignments, a wrapper (`env`, `nice`, `nohup`, `time`, `timeout N`, `npx`,
 `uv run`, `bash -c`) and a path — so `git commit -m 'fix make'` or `pip install pytest` stay light; a script name

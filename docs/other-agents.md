@@ -25,7 +25,7 @@ agent: `exec` keeps the pid, so the hub ends the session when the agent exits. T
 `AGENTHUB_SESSION` (an `agenthub run` it types belongs to the session) and, first in `PATH`, the directory
 `$XDG_RUNTIME_DIR/agenthub/shims` with one small script per tool:
 
-`make cmake ninja gradle mvn npm pnpm yarn bun npx bunx tsc webpack rollup vite next jest vitest mocha
+`make cmake ninja gradle mvn npm pnpm yarn bun npx bunx tsc webpack rollup vite next nest jest vitest mocha
 playwright cypress pytest uv poetry rspec phpunit go cargo`
 
 A shim looks at the command it was called as (`npm run build`, `cargo test`):

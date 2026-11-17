@@ -18,7 +18,7 @@ MARK = '# agenthub shim'
 # the programs the built-in kinds start with; a command started by its path (`./gradlew`) passes them by
 # (not interpreters such as `python3` or `node`: each of their calls would start one more interpreter)
 TOOLS = ('make', 'cmake', 'ninja', 'gradle', 'mvn', 'npm', 'pnpm', 'yarn', 'bun', 'npx', 'bunx', 'tsc', 'webpack',
-         'rollup', 'vite', 'next', 'jest', 'vitest', 'mocha', 'playwright', 'cypress', 'pytest', 'uv', 'poetry',
+         'rollup', 'vite', 'next', 'nest', 'jest', 'vitest', 'mocha', 'playwright', 'cypress', 'pytest', 'uv', 'poetry',
          'rspec', 'phpunit', 'go', 'cargo')
 
 

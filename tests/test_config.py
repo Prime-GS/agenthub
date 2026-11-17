@@ -48,11 +48,13 @@ class BuildTest(unittest.TestCase):
                  'NODE_ENV=production npm run build': 'build', 'time cargo build --release': 'build',
                  'timeout 600 npm test': 'test', 'uv run pytest -x': 'test', 'python3 -m unittest -v': 'test',
                  "bash -c 'make all'": 'build', '(cd web; npx vitest run)': 'test',
-                 'npm test 2>&1 | tail -20': 'test', 'git pull && npx playwright test': 'browser'}
+                 'npm test 2>&1 | tail -20': 'test', 'git pull && npx playwright test': 'browser',
+                 'npx nest build 2>&1 | tail -5': 'build', 'timeout 300 nest build': 'build'}
         for line, kind in heavy.items():
             self.assertEqual(cfg.kind_for(line).name, kind, line)
         for line in ("git commit -m 'fix make test'", 'pip install pytest', 'rg jest src', 'which tsc', 'man make',
-                     'echo make', 'cat Makefile', 'vim webpack.config.js', 'docker build .', 'maker', 'npm install'):
+                     'echo make', 'cat Makefile', 'vim webpack.config.js', 'docker build .', 'maker', 'npm install',
+                     'npx nest start --watch', 'nestjs build'):
             self.assertEqual(cfg.kind_for(line).name, 'other', line)
         self.assertEqual(c.build({'kinds': []}, 32 * GIB).kind_for('make all').name, 'other')   # turned off
         own = c.build({'kinds': [{'name': 'e2e', 'match': 'cypress'}]}, 32 * GIB)

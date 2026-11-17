@@ -517,6 +517,9 @@ class ClientTest(unittest.TestCase):
         env = mock.patch.dict(os.environ, {'AGENTHUB_SOCKET': self.w.sock, 'AGENTHUB_PREFIX': PFX,
                                            'AGENTHUB_CONFIG': os.path.join(self.w.dir, 'none.toml')})
         env.start()
+        # an agent session that runs the tests (the Claude Code plugin, `agenthub wrap`) sets these
+        for name in ('AGENTHUB_SESSION', 'AGENTHUB_SESSION_PID', 'AGENTHUB_AGENT', 'AGENTHUB_RUN'):
+            os.environ.pop(name, None)
         self.addCleanup(env.stop)
         nosystemd = mock.patch('agenthub.system.can_make_scopes', return_value=False)
         nosystemd.start()

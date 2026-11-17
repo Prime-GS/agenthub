@@ -28,7 +28,7 @@ DEFAULT_KINDS = [
               r'|(?:gradlew?|mvnw?) test|' + _NPM + r'test)' + _END},
     {'name': 'build', 'estimate': '2G',   # not `docker build`: its memory is charged to the Docker daemon
      'match': _START + r'(?:tsc|webpack|rollup|vite build|next build|cargo build|go build|gradlew?|mvnw?|make'
-              r'|cmake --build|ninja|' + _NPM + r'build)' + _END},
+              r'|cmake --build|ninja|nest build|' + _NPM + r'build)' + _END},
 ]
 
 
